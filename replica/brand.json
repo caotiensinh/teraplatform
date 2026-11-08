@@ -1,0 +1,6 @@
+{
+  "name": "Tera Platform",
+  "avoid": ["HashiCorp", "HCP Terraform", "Terraform Cloud", "Terraform Enterprise", "Sentinel"],
+  "domains": ["terraform.io", "hashicorp.com", "app.terraform.io"],
+  "colors": ["#7B42BC", "#844FBA", "#5C4EE5"]
+}

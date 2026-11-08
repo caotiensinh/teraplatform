@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Design check: app shell</title>
+<link rel="stylesheet" href="tokens.css">
+</head>
+<body>
+<div class="shell">
+  <header class="topbar">
+    <span class="brand"><i></i>Platform</span>
+    <span class="org-switch">acme-infra ▾</span>
+    <span class="search">Search workspaces, runs, state <span class="kbd">Ctrl K</span></span>
+    <button class="btn btn-ghost btn-sm" id="theme">Theme</button>
+  </header>
+
+  <nav class="sidebar" aria-label="Main">
+    <a class="nav-item" href="#" data-go="ws">Workspaces <span class="nav-count">42</span></a>
+    <a class="nav-item" href="#" data-go="run" aria-current="page">Runs <span class="nav-count">3 need you</span></a>
+    <a class="nav-item" href="#">Projects</a>
+    <a class="nav-item" href="#">Policies</a>
+    <div class="nav-group">Organization</div>
+    <a class="nav-item" href="#">Teams</a>
+    <a class="nav-item" href="#">Tokens</a>
+    <a class="nav-item" href="#">Agents</a>
+    <a class="nav-item" href="#">Audit log</a>
+  </nav>
+
+  <main class="content">
+    <!-- View A: workspaces list -->
+    <section id="ws" hidden>
+      <div class="page-header">
+        <div><div class="crumbs">acme-infra</div><h1>Workspaces</h1></div>
+        <button class="btn btn-primary">New workspace</button>
+      </div>
+      <div class="toolbar">
+        <div class="field"><label class="sr-only" for="q">Filter</label><input id="q" placeholder="Filter by name, tag, status"></div>
+        <span class="chip">project: all</span><span class="chip">status: needs attention</span>
+      </div>
+      <div class="table-wrap">
+        <table class="table">
+          <thead><tr><th>Workspace</th><th>Current run</th><th>Resources</th><th>Last change</th><th>Tags</th></tr></thead>
+          <tbody>
+            <tr><td><a href="#" data-go="run" class="mono">prod-network</a></td><td><span class="badge badge-warning" data-icon="✋">Needs confirmation</span></td><td>184</td><td class="muted">4 min ago</td><td><span class="chip">aws</span> <span class="chip">prod</span></td></tr>
+            <tr><td><a href="#" class="mono">staging-db</a></td><td><span class="badge badge-success" data-icon="✓">Applied</span></td><td>37</td><td class="muted">2 h ago</td><td><span class="chip">aws</span></td></tr>
+            <tr><td><a href="#" class="mono">dev-app</a></td><td><span class="badge badge-danger" data-icon="✕">Errored</span></td><td>12</td><td class="muted">yesterday</td><td><span class="chip">gcp</span></td></tr>
+            <tr><td><a href="#" class="mono">prod-iam</a></td><td><span class="badge badge-info" data-icon="◐">Planning</span></td><td>96</td><td class="muted">just now</td><td><span class="chip">aws</span> <span class="chip">prod</span></td></tr>
+            <tr><td><a href="#" class="mono">shared-dns</a></td><td><span class="badge badge-neutral" data-icon="∅">No runs yet</span></td><td>0</td><td class="muted">never</td><td></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- View B: run detail -->
+    <section id="run">
+      <div class="page-header">
+        <div>
+          <div class="crumbs">acme-infra / prod-network / runs</div>
+          <h1><span class="mono">run-8f2a</span> <span class="badge badge-warning" data-icon="✋">Needs confirmation</span></h1>
+        </div>
+        <div style="display:flex;gap:8px"><button class="btn btn-secondary">View config</button><button class="btn btn-secondary">Copy run ID</button></div>
+      </div>
+
+      <div class="banner banner-warning" role="status">
+        <span>Workspace locked by this run. Other runs are queued behind it (2).</span>
+        <span class="mono muted" style="margin-left:auto">lease ends 14:20 UTC</span>
+      </div>
+
+      <ol class="stepper" aria-label="Run stages">
+        <li class="done">✓ Fetch <small>3s</small></li>
+        <li class="done">✓ Plan <small>41s</small></li>
+        <li class="done">✓ Policy <small>2s</small></li>
+        <li aria-current="step">✋ Confirm <small>waiting</small></li>
+        <li>Apply</li>
+        <li>Done</li>
+      </ol>
+
+      <div class="stats">
+        <div class="stat"><div class="k">Add</div><div class="v" style="color:var(--color-success)">3</div></div>
+        <div class="stat"><div class="k">Change</div><div class="v" style="color:var(--color-warning)">1</div></div>
+        <div class="stat"><div class="k">Destroy</div><div class="v" style="color:var(--color-danger)">1</div></div>
+        <div class="stat"><div class="k">Policy</div><div class="v">2 <small>passed, 1 advisory</small></div></div>
+        <div class="stat"><div class="k">Plan time</div><div class="v">41<small>s</small></div></div>
+      </div>
+
+      <div class="cols">
+        <div>
+          <h2 style="font:var(--text-lg);margin:0 0 8px">Resource changes</h2>
+          <div class="diff">
+            <div class="diff-row add"><span class="sym" style="color:var(--color-success)">+</span><span>aws_s3_bucket.logs</span><span class="muted">create</span></div>
+            <div class="diff-row add"><span class="sym" style="color:var(--color-success)">+</span><span>aws_s3_bucket_versioning.logs</span><span class="muted">create</span></div>
+            <div class="diff-row add"><span class="sym" style="color:var(--color-success)">+</span><span>aws_route53_record.api</span><span class="muted">create</span></div>
+            <div class="diff-row chg"><span class="sym" style="color:var(--color-warning)">~</span><span>aws_iam_role.ci</span><span class="muted">update in place</span></div>
+            <div class="diff-row del"><span class="sym" style="color:var(--color-danger)">−</span><span>aws_security_group.legacy</span><span class="muted">destroy</span></div>
+          </div>
+
+          <h2 style="font:var(--text-lg);margin:20px 0 8px">Plan log</h2>
+          <div class="log" role="log" aria-live="off"><span class="ts">14:02:11</span>Initializing the backend...
+<span class="ts">14:02:13</span>Refreshing state... [184 resources]
+<span class="ts">14:02:41</span><span class="g">+ aws_s3_bucket.logs</span>
+<span class="ts">14:02:41</span><span class="y">~ aws_iam_role.ci</span>
+<span class="ts">14:02:41</span><span class="r">- aws_security_group.legacy</span>
+<span class="ts">14:02:52</span>Plan: 3 to add, 1 to change, 1 to destroy.</div>
+        </div>
+
+        <aside>
+          <div class="card">
+            <div class="card-h">Details</div>
+            <div class="card-b">
+              <dl class="kv" style="grid-template-columns:96px 1fr">
+                <dt>Trigger</dt><dd>push <span class="mono">a1b2c3d</span></dd>
+                <dt>Author</dt><dd>ana</dd>
+                <dt>Engine</dt><dd class="mono">tofu 1.13.0</dd>
+                <dt>Mode</dt><dd>plan and apply</dd>
+                <dt>Config</dt><dd class="mono">cv-31c9</dd>
+                <dt>State in</dt><dd class="mono">serial 212</dd>
+              </dl>
+            </div>
+          </div>
+          <div class="card" style="margin-top:12px">
+            <div class="card-h">Policies</div>
+            <div class="card-b" style="display:grid;gap:8px">
+              <div><span class="badge badge-success" data-icon="✓">Passed</span> tagging-required</div>
+              <div><span class="badge badge-success" data-icon="✓">Passed</span> no-public-buckets</div>
+              <div><span class="badge badge-warning" data-icon="!">Advisory</span> prefer-versioning</div>
+            </div>
+          </div>
+        </aside>
+      </div>
+
+      <div class="actionbar">
+        <span><strong>Apply 1 destroy?</strong> <span class="muted">aws_security_group.legacy will be deleted.</span></span>
+        <span class="spacer"></span>
+        <div class="field" style="width:240px"><label class="sr-only" for="c">Comment</label><input id="c" placeholder="Add a comment (optional)"></div>
+        <button class="btn btn-secondary">Discard run</button>
+        <button class="btn btn-primary">Confirm &amp; apply</button>
+      </div>
+    </section>
+  </main>
+</div>
+<script>
+  var r=document.documentElement;
+  document.getElementById('theme').onclick=function(){r.dataset.theme=r.dataset.theme==='dark'?'light':'dark'};
+  document.querySelectorAll('[data-go]').forEach(function(a){a.onclick=function(e){e.preventDefault();
+    var t=a.dataset.go;document.getElementById('ws').hidden=t!=='ws';document.getElementById('run').hidden=t!=='run';
+    document.querySelectorAll('.nav-item').forEach(function(n){n.removeAttribute('aria-current')});
+    var m=document.querySelector('.nav-item[data-go="'+t+'"]');if(m)m.setAttribute('aria-current','page');}});
+</script>
+</body>
+</html>

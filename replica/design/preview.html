@@ -1,0 +1,342 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Design check: app shell</title>
+<style>
+/* Generated from tokens.json / tokens-dark.json. Components use var(--color-*), never raw hex. */
+:root {
+  --color-bg: #ffffff; --color-surface: #f6f7f8; --color-surface-raised: #ffffff;
+  --color-border: #e2e5e9; --color-border-input: #79828e;
+  --color-text: #12161b; --color-text-muted: #515a66;
+  --color-accent: #0b6b63; --color-on-accent: #ffffff; --color-accent-bg: #e3f4f1;
+  --color-danger: #b42323; --color-danger-bg: #fdecec;
+  --color-success: #1a6e43; --color-success-bg: #e5f4eb;
+  --color-warning: #7f4d00; --color-warning-bg: #fff3d9;
+  --color-info: #1d5c94; --color-info-bg: #e7f0f9;
+  --color-neutral-bg: #eceef1;
+  --color-diff-add-bg: #e5f4eb; --color-diff-chg-bg: #fff3d9; --color-diff-del-bg: #fdecec;
+  --color-log-bg: #0e1115; --color-log-text: #e4e7eb; --color-log-muted: #98a2b0;
+
+  --font-sans: Inter, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  --text-xs: 500 12px/16px var(--font-sans);
+  --text-sm: 400 13px/18px var(--font-sans);
+  --text-base: 400 14px/20px var(--font-sans);
+  --text-lg: 600 16px/24px var(--font-sans);
+  --text-xl: 650 20px/28px var(--font-sans);
+  --text-log: 400 12.5px/19px var(--font-mono);
+
+  --space-0: 0; --space-1: 2px; --space-2: 4px; --space-3: 8px; --space-4: 12px;
+  --space-5: 16px; --space-6: 24px; --space-7: 32px; --space-8: 48px;
+  --radius-sm: 3px; --radius-md: 6px; --radius-lg: 8px; --radius-pill: 999px;
+  --shadow-card: 0 1px 0 rgba(16,24,40,.04); --shadow-pop: 0 8px 24px rgba(16,24,40,.14);
+  --motion-fast: 100ms; --motion-base: 160ms; --motion-ease: cubic-bezier(.2,.8,.2,1);
+  --row: 36px; --control: 32px; --control-sm: 28px; --control-lg: 40px;
+  --layout-max: 1440px; --layout-sidebar: 224px; --layout-header: 48px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --color-bg: #0e1115; --color-surface: #151a20; --color-surface-raised: #1b2129;
+    --color-border: #272e37; --color-border-input: #8691a0;
+    --color-text: #e8ebef; --color-text-muted: #a1abb8;
+    --color-accent: #4fd1c0; --color-on-accent: #04201c; --color-accent-bg: #10302c;
+    --color-danger: #ff9090; --color-danger-bg: #3a1a1a;
+    --color-success: #6fd69b; --color-success-bg: #14301f;
+    --color-warning: #f0b45a; --color-warning-bg: #35280f;
+    --color-info: #7fb9ee; --color-info-bg: #12283d; --color-neutral-bg: #232932;
+    --color-diff-add-bg: #14301f; --color-diff-chg-bg: #35280f; --color-diff-del-bg: #3a1a1a;
+    --shadow-card: none; --shadow-pop: 0 8px 24px rgba(0,0,0,.5);
+  }
+}
+:root[data-theme="dark"] {
+  --color-bg: #0e1115; --color-surface: #151a20; --color-surface-raised: #1b2129;
+  --color-border: #272e37; --color-border-input: #8691a0;
+  --color-text: #e8ebef; --color-text-muted: #a1abb8;
+  --color-accent: #4fd1c0; --color-on-accent: #04201c; --color-accent-bg: #10302c;
+  --color-danger: #ff9090; --color-danger-bg: #3a1a1a;
+  --color-success: #6fd69b; --color-success-bg: #14301f;
+  --color-warning: #f0b45a; --color-warning-bg: #35280f;
+  --color-info: #7fb9ee; --color-info-bg: #12283d; --color-neutral-bg: #232932;
+  --color-diff-add-bg: #14301f; --color-diff-chg-bg: #35280f; --color-diff-del-bg: #3a1a1a;
+  --shadow-card: none; --shadow-pop: 0 8px 24px rgba(0,0,0,.5);
+}
+
+/* ---- base ---- */
+*, *::before, *::after { box-sizing: border-box; }
+html { color-scheme: light dark; }
+body { margin: 0; background: var(--color-bg); color: var(--color-text); font: var(--text-base); }
+a { color: var(--color-accent); text-decoration: none; } a:hover { text-decoration: underline; }
+:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 1px; }
+.mono, code { font-family: var(--font-mono); font-size: 12.5px; }
+.muted { color: var(--color-text-muted); }
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+
+/* ---- app shell ---- */
+.shell { display: grid; grid-template-columns: var(--layout-sidebar) 1fr; grid-template-rows: var(--layout-header) 1fr; min-height: 100vh; }
+.topbar { grid-column: 1 / -1; display: flex; align-items: center; gap: var(--space-4); padding: 0 var(--space-5);
+  border-bottom: 1px solid var(--color-border); background: var(--color-bg); position: sticky; top: 0; z-index: 5; }
+.brand { font-weight: 700; letter-spacing: -.01em; display: flex; align-items: center; gap: var(--space-3); }
+.brand i { width: 18px; height: 18px; border-radius: var(--radius-sm); background: var(--color-accent); display: inline-block; }
+.org-switch { display: flex; align-items: center; gap: var(--space-2); padding: 0 var(--space-3); height: var(--control-sm);
+  border: 1px solid var(--color-border); border-radius: var(--radius-md); background: var(--color-surface); font: var(--text-sm); }
+.search { margin-left: auto; display: flex; align-items: center; gap: var(--space-3); height: var(--control-sm); padding: 0 var(--space-3);
+  min-width: 260px; border: 1px solid var(--color-border-input); border-radius: var(--radius-md); color: var(--color-text-muted); font: var(--text-sm); background: var(--color-bg); }
+.kbd { font: 500 11px/1 var(--font-mono); padding: 2px 5px; border: 1px solid var(--color-border); border-radius: var(--radius-sm); background: var(--color-surface); color: var(--color-text-muted); }
+.sidebar { border-right: 1px solid var(--color-border); background: var(--color-surface); padding: var(--space-4) var(--space-3); }
+.nav-group { font: var(--text-xs); text-transform: uppercase; letter-spacing: .06em; color: var(--color-text-muted); padding: var(--space-4) var(--space-3) var(--space-2); }
+.nav-item { display: flex; align-items: center; justify-content: space-between; height: var(--control); padding: 0 var(--space-3);
+  border-radius: var(--radius-md); color: var(--color-text); font: var(--text-base); }
+.nav-item:hover { background: var(--color-neutral-bg); text-decoration: none; }
+.nav-item[aria-current="page"] { background: var(--color-accent-bg); color: var(--color-accent); font-weight: 600; }
+.nav-count { font: var(--text-xs); color: var(--color-text-muted); }
+.content { padding: var(--space-6); max-width: var(--layout-max); width: 100%; min-width: 0; }
+.page-header { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--space-5); margin-bottom: var(--space-5); }
+.page-header h1 { font: var(--text-xl); margin: 0; }
+.crumbs { font: var(--text-sm); color: var(--color-text-muted); margin-bottom: var(--space-2); }
+.tabs { display: flex; gap: var(--space-5); border-bottom: 1px solid var(--color-border); margin-bottom: var(--space-5); }
+.tab { padding: var(--space-3) 0; color: var(--color-text-muted); font: var(--text-base); border-bottom: 2px solid transparent; margin-bottom: -1px; }
+.tab[aria-selected="true"] { color: var(--color-text); border-color: var(--color-accent); font-weight: 600; }
+
+/* ---- stat strip, key-value ---- */
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); border: 1px solid var(--color-border); border-radius: var(--radius-lg); background: var(--color-surface-raised); margin-bottom: var(--space-5); }
+.stat { padding: var(--space-4) var(--space-5); border-right: 1px solid var(--color-border); }
+.stat:last-child { border-right: 0; }
+.stat .k { font: var(--text-xs); color: var(--color-text-muted); text-transform: uppercase; letter-spacing: .05em; }
+.stat .v { font: 650 20px/28px var(--font-sans); }
+.stat .v small { font: var(--text-sm); color: var(--color-text-muted); font-weight: 400; }
+.kv { display: grid; grid-template-columns: 140px 1fr; gap: var(--space-3) var(--space-5); font: var(--text-base); margin: 0; }
+.kv dt { color: var(--color-text-muted); } .kv dd { margin: 0; }
+
+/* ---- buttons ---- */
+.btn { display: inline-flex; align-items: center; white-space: nowrap; flex: none; gap: var(--space-3); height: var(--control); padding: 0 var(--space-4);
+  border: 1px solid transparent; border-radius: var(--radius-md); font: 600 13px/18px var(--font-sans); cursor: pointer;
+  transition: background var(--motion-fast) var(--motion-ease), filter var(--motion-fast); text-decoration: none; }
+.btn-sm { height: var(--control-sm); padding: 0 var(--space-3); } .btn-lg { height: var(--control-lg); padding: 0 var(--space-5); }
+.btn-primary { background: var(--color-accent); color: var(--color-on-accent); } .btn-primary:hover { filter: brightness(1.12); text-decoration: none; }
+.btn-secondary { background: var(--color-surface-raised); color: var(--color-text); border-color: var(--color-border-input); }
+.btn-secondary:hover { background: var(--color-neutral-bg); text-decoration: none; }
+.btn-ghost { background: transparent; color: var(--color-text); } .btn-ghost:hover { background: var(--color-neutral-bg); text-decoration: none; }
+.btn-danger { background: var(--color-danger); color: var(--color-bg); }
+.btn[disabled], .btn[aria-disabled="true"] { opacity: .5; cursor: not-allowed; }
+.btn[aria-busy="true"]::after { content: ""; width: 12px; height: 12px; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: spin .8s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ---- fields ---- */
+.field label { display: block; font: 600 13px/18px var(--font-sans); margin-bottom: var(--space-2); }
+.field input, .field select, .field textarea { width: 100%; height: var(--control); padding: 0 var(--space-3); background: var(--color-bg); color: var(--color-text);
+  border: 1px solid var(--color-border-input); border-radius: var(--radius-md); font: var(--text-base); }
+.field textarea { height: auto; padding: var(--space-3); min-height: 64px; }
+.field .hint { font: var(--text-xs); color: var(--color-text-muted); margin-top: var(--space-2); }
+.field.error input { border-color: var(--color-danger); } .field.error .hint { color: var(--color-danger); }
+
+/* ---- card, badge ---- */
+.card { background: var(--color-surface-raised); border: 1px solid var(--color-border); border-radius: var(--radius-lg); box-shadow: var(--shadow-card); }
+.card-h { margin: 0; display: flex; align-items: center; justify-content: space-between; padding: var(--space-4) var(--space-5); border-bottom: 1px solid var(--color-border); font: var(--text-lg); }
+.card-b { padding: var(--space-5); }
+.badge { display: inline-flex; align-items: center; gap: var(--space-2); padding: 1px var(--space-3); border-radius: var(--radius-pill); font: var(--text-xs); white-space: nowrap; }
+.badge::before { content: attr(data-icon); }
+.badge-success { background: var(--color-success-bg); color: var(--color-success); } .badge-danger { background: var(--color-danger-bg); color: var(--color-danger); }
+.badge-warning { background: var(--color-warning-bg); color: var(--color-warning); } .badge-info { background: var(--color-info-bg); color: var(--color-info); }
+.badge-neutral { background: var(--color-neutral-bg); color: var(--color-text); }
+.chip { display: inline-block; padding: 0 var(--space-3); border: 1px solid var(--color-border); border-radius: var(--radius-sm); font: var(--text-xs); color: var(--color-text-muted); background: var(--color-surface); }
+
+/* ---- table (dense) ---- */
+.table-wrap { border: 1px solid var(--color-border); border-radius: var(--radius-lg); overflow-x: auto; overflow-y: hidden; background: var(--color-surface-raised); }
+.table { width: 100%; border-collapse: collapse; font: var(--text-base); }
+.table th { text-align: left; color: var(--color-text-muted); font: 600 12px/16px var(--font-sans); text-transform: uppercase; letter-spacing: .04em; padding: 0 var(--space-4); height: 32px; background: var(--color-surface); border-bottom: 1px solid var(--color-border); position: sticky; top: 0; }
+.table td { padding: 0 var(--space-4); height: var(--row); border-bottom: 1px solid var(--color-border); }
+.table tr:last-child td { border-bottom: 0; } .table tbody tr:hover td { background: var(--color-surface); }
+.toolbar { display: flex; flex-wrap: wrap; gap: var(--space-3); align-items: center; margin-bottom: var(--space-4); }
+.toolbar .field input { width: 280px; }
+
+/* ---- run detail ---- */
+.banner { display: flex; align-items: center; gap: var(--space-4); padding: var(--space-3) var(--space-5); border-radius: var(--radius-md); font: var(--text-base); margin-bottom: var(--space-5); border: 1px solid transparent; }
+.banner-warning { background: var(--color-warning-bg); color: var(--color-warning); } .banner-danger { background: var(--color-danger-bg); color: var(--color-danger); }
+.stepper { display: flex; gap: 0; list-style: none; padding: 0; margin: 0; font: var(--text-sm); border: 1px solid var(--color-border); border-radius: var(--radius-lg); overflow: hidden; background: var(--color-surface-raised); margin-bottom: var(--space-5); }
+.stepper li { flex: 1; padding: var(--space-3) var(--space-4); border-right: 1px solid var(--color-border); color: var(--color-text-muted); display: flex; gap: var(--space-3); align-items: center; }
+.stepper li:last-child { border-right: 0; }
+.stepper li.done { color: var(--color-success); } .stepper li.failed { color: var(--color-danger); }
+.stepper li[aria-current="step"] { background: var(--color-accent-bg); color: var(--color-accent); font-weight: 600; }
+.stepper small { margin-left: auto; font: 400 11px/1 var(--font-mono); }
+.plan-sum { display: flex; gap: var(--space-5); font: var(--text-lg); }
+.plan-sum .add { color: var(--color-success); } .plan-sum .chg { color: var(--color-warning); } .plan-sum .del { color: var(--color-danger); }
+.diff { border: 1px solid var(--color-border); border-radius: var(--radius-lg); overflow: hidden; }
+.diff-row { display: grid; grid-template-columns: 28px 1fr auto; align-items: center; height: var(--row); padding: 0 var(--space-4); border-bottom: 1px solid var(--color-border); font: 400 12.5px/18px var(--font-mono); }
+.diff-row:last-child { border-bottom: 0; }
+.diff-row.add { background: var(--color-diff-add-bg); } .diff-row.chg { background: var(--color-diff-chg-bg); } .diff-row.del { background: var(--color-diff-del-bg); }
+.diff-row .sym { font-weight: 700; }
+.log { background: var(--color-log-bg); color: var(--color-log-text); font: var(--text-log); padding: var(--space-4) var(--space-5); border-radius: var(--radius-lg); overflow: auto; max-height: 320px; white-space: pre-wrap; border: 1px solid var(--color-border); }
+.log .ts { color: var(--color-log-muted); margin-right: var(--space-3); }
+.log .g { color: #6fd69b; } .log .y { color: #f0b45a; } .log .r { color: #ff9090; }
+.actionbar { position: sticky; bottom: 0; display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-4); padding: var(--space-4) var(--space-5);
+  background: var(--color-surface-raised); border: 1px solid var(--color-border-input); border-radius: var(--radius-lg); box-shadow: var(--shadow-pop); margin-top: var(--space-5); }
+.actionbar .spacer { flex: 1; }
+.cols { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: var(--space-5); }
+
+/* Under 960px the sidebar becomes a strip under the top bar, so navigation never disappears. */
+@media (max-width: 960px) {
+  .shell { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto auto 1fr; }
+  .sidebar { display: flex; gap: var(--space-2); overflow-x: auto; padding: var(--space-2) var(--space-4); border-right: 0; border-bottom: 1px solid var(--color-border); }
+  .sidebar .nav-group { display: none; }
+  .nav-item { flex: none; gap: var(--space-3); }
+  .cols { grid-template-columns: 1fr; }
+  .search { min-width: 0; }
+  .content { padding: var(--space-5) var(--space-4); }
+}
+@media (max-width: 640px) {
+  .topbar { flex-wrap: wrap; height: auto; min-height: var(--layout-header); padding: var(--space-3) var(--space-4); row-gap: var(--space-2); }
+  .hide-sm { display: none !important; }
+  .page-header { flex-wrap: wrap; }
+  .kv { grid-template-columns: 1fr; gap: var(--space-1) 0; }
+  .stat { padding: var(--space-3) var(--space-4); }
+}
+@media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+
+</style>
+</head>
+<body>
+<div class="shell">
+  <header class="topbar">
+    <span class="brand"><i></i>Platform</span>
+    <span class="org-switch">acme-infra ▾</span>
+    <span class="search">Search workspaces, runs, state <span class="kbd">Ctrl K</span></span>
+    <button class="btn btn-ghost btn-sm" id="theme">Theme</button>
+  </header>
+
+  <nav class="sidebar" aria-label="Main">
+    <a class="nav-item" href="#" data-go="ws">Workspaces <span class="nav-count">42</span></a>
+    <a class="nav-item" href="#" data-go="run" aria-current="page">Runs <span class="nav-count">3 need you</span></a>
+    <a class="nav-item" href="#">Projects</a>
+    <a class="nav-item" href="#">Policies</a>
+    <div class="nav-group">Organization</div>
+    <a class="nav-item" href="#">Teams</a>
+    <a class="nav-item" href="#">Tokens</a>
+    <a class="nav-item" href="#">Agents</a>
+    <a class="nav-item" href="#">Audit log</a>
+  </nav>
+
+  <main class="content">
+    <!-- View A: workspaces list -->
+    <section id="ws" hidden>
+      <div class="page-header">
+        <div><div class="crumbs">acme-infra</div><h1>Workspaces</h1></div>
+        <button class="btn btn-primary">New workspace</button>
+      </div>
+      <div class="toolbar">
+        <div class="field"><label class="sr-only" for="q">Filter</label><input id="q" placeholder="Filter by name, tag, status"></div>
+        <span class="chip">project: all</span><span class="chip">status: needs attention</span>
+      </div>
+      <div class="table-wrap">
+        <table class="table">
+          <thead><tr><th>Workspace</th><th>Current run</th><th>Resources</th><th>Last change</th><th>Tags</th></tr></thead>
+          <tbody>
+            <tr><td><a href="#" data-go="run" class="mono">prod-network</a></td><td><span class="badge badge-warning" data-icon="✋">Needs confirmation</span></td><td>184</td><td class="muted">4 min ago</td><td><span class="chip">aws</span> <span class="chip">prod</span></td></tr>
+            <tr><td><a href="#" class="mono">staging-db</a></td><td><span class="badge badge-success" data-icon="✓">Applied</span></td><td>37</td><td class="muted">2 h ago</td><td><span class="chip">aws</span></td></tr>
+            <tr><td><a href="#" class="mono">dev-app</a></td><td><span class="badge badge-danger" data-icon="✕">Errored</span></td><td>12</td><td class="muted">yesterday</td><td><span class="chip">gcp</span></td></tr>
+            <tr><td><a href="#" class="mono">prod-iam</a></td><td><span class="badge badge-info" data-icon="◐">Planning</span></td><td>96</td><td class="muted">just now</td><td><span class="chip">aws</span> <span class="chip">prod</span></td></tr>
+            <tr><td><a href="#" class="mono">shared-dns</a></td><td><span class="badge badge-neutral" data-icon="∅">No runs yet</span></td><td>0</td><td class="muted">never</td><td></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- View B: run detail -->
+    <section id="run">
+      <div class="page-header">
+        <div>
+          <div class="crumbs">acme-infra / prod-network / runs</div>
+          <h1><span class="mono">run-8f2a</span> <span class="badge badge-warning" data-icon="✋">Needs confirmation</span></h1>
+        </div>
+        <div style="display:flex;gap:8px"><button class="btn btn-secondary">View config</button><button class="btn btn-secondary">Copy run ID</button></div>
+      </div>
+
+      <div class="banner banner-warning" role="status">
+        <span>Workspace locked by this run. Other runs are queued behind it (2).</span>
+        <span class="mono muted" style="margin-left:auto">lease ends 14:20 UTC</span>
+      </div>
+
+      <ol class="stepper" aria-label="Run stages">
+        <li class="done">✓ Fetch <small>3s</small></li>
+        <li class="done">✓ Plan <small>41s</small></li>
+        <li class="done">✓ Policy <small>2s</small></li>
+        <li aria-current="step">✋ Confirm <small>waiting</small></li>
+        <li>Apply</li>
+        <li>Done</li>
+      </ol>
+
+      <div class="stats">
+        <div class="stat"><div class="k">Add</div><div class="v" style="color:var(--color-success)">3</div></div>
+        <div class="stat"><div class="k">Change</div><div class="v" style="color:var(--color-warning)">1</div></div>
+        <div class="stat"><div class="k">Destroy</div><div class="v" style="color:var(--color-danger)">1</div></div>
+        <div class="stat"><div class="k">Policy</div><div class="v">2 <small>passed, 1 advisory</small></div></div>
+        <div class="stat"><div class="k">Plan time</div><div class="v">41<small>s</small></div></div>
+      </div>
+
+      <div class="cols">
+        <div>
+          <h2 style="font:var(--text-lg);margin:0 0 8px">Resource changes</h2>
+          <div class="diff">
+            <div class="diff-row add"><span class="sym" style="color:var(--color-success)">+</span><span>aws_s3_bucket.logs</span><span class="muted">create</span></div>
+            <div class="diff-row add"><span class="sym" style="color:var(--color-success)">+</span><span>aws_s3_bucket_versioning.logs</span><span class="muted">create</span></div>
+            <div class="diff-row add"><span class="sym" style="color:var(--color-success)">+</span><span>aws_route53_record.api</span><span class="muted">create</span></div>
+            <div class="diff-row chg"><span class="sym" style="color:var(--color-warning)">~</span><span>aws_iam_role.ci</span><span class="muted">update in place</span></div>
+            <div class="diff-row del"><span class="sym" style="color:var(--color-danger)">−</span><span>aws_security_group.legacy</span><span class="muted">destroy</span></div>
+          </div>
+
+          <h2 style="font:var(--text-lg);margin:20px 0 8px">Plan log</h2>
+          <div class="log" role="log" aria-live="off"><span class="ts">14:02:11</span>Initializing the backend...
+<span class="ts">14:02:13</span>Refreshing state... [184 resources]
+<span class="ts">14:02:41</span><span class="g">+ aws_s3_bucket.logs</span>
+<span class="ts">14:02:41</span><span class="y">~ aws_iam_role.ci</span>
+<span class="ts">14:02:41</span><span class="r">- aws_security_group.legacy</span>
+<span class="ts">14:02:52</span>Plan: 3 to add, 1 to change, 1 to destroy.</div>
+        </div>
+
+        <aside>
+          <div class="card">
+            <div class="card-h">Details</div>
+            <div class="card-b">
+              <dl class="kv" style="grid-template-columns:96px 1fr">
+                <dt>Trigger</dt><dd>push <span class="mono">a1b2c3d</span></dd>
+                <dt>Author</dt><dd>ana</dd>
+                <dt>Engine</dt><dd class="mono">tofu 1.13.0</dd>
+                <dt>Mode</dt><dd>plan and apply</dd>
+                <dt>Config</dt><dd class="mono">cv-31c9</dd>
+                <dt>State in</dt><dd class="mono">serial 212</dd>
+              </dl>
+            </div>
+          </div>
+          <div class="card" style="margin-top:12px">
+            <div class="card-h">Policies</div>
+            <div class="card-b" style="display:grid;gap:8px">
+              <div><span class="badge badge-success" data-icon="✓">Passed</span> tagging-required</div>
+              <div><span class="badge badge-success" data-icon="✓">Passed</span> no-public-buckets</div>
+              <div><span class="badge badge-warning" data-icon="!">Advisory</span> prefer-versioning</div>
+            </div>
+          </div>
+        </aside>
+      </div>
+
+      <div class="actionbar">
+        <span><strong>Apply 1 destroy?</strong> <span class="muted">aws_security_group.legacy will be deleted.</span></span>
+        <span class="spacer"></span>
+        <div class="field" style="width:240px"><label class="sr-only" for="c">Comment</label><input id="c" placeholder="Add a comment (optional)"></div>
+        <button class="btn btn-secondary">Discard run</button>
+        <button class="btn btn-primary">Confirm &amp; apply</button>
+      </div>
+    </section>
+  </main>
+</div>
+<script>
+  var r=document.documentElement;
+  document.getElementById('theme').onclick=function(){r.dataset.theme=r.dataset.theme==='dark'?'light':'dark'};
+  document.querySelectorAll('[data-go]').forEach(function(a){a.onclick=function(e){e.preventDefault();
+    var t=a.dataset.go;document.getElementById('ws').hidden=t!=='ws';document.getElementById('run').hidden=t!=='run';
+    document.querySelectorAll('.nav-item').forEach(function(n){n.removeAttribute('aria-current')});
+    var m=document.querySelector('.nav-item[data-go="'+t+'"]');if(m)m.setAttribute('aria-current','page');}});
+</script>
+</body>
+</html>

@@ -1,0 +1,34 @@
+[package]
+name = "tf-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "tf_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tf-server"
+path = "src/main.rs"
+
+[dependencies]
+tf-core = { path = "../tf-core" }
+tf-crypto = { path = "../tf-crypto" }
+tf-engine = { path = "../tf-engine" }
+tf-store = { path = "../tf-store" }
+axum = "0.8"
+argon2 = "0.5"
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio-stream = "0.1"
+serde_urlencoded = "0.7"
+flate2 = "1"
+tar = "0.4"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+async-trait.workspace = true
+flate2 = "1"
+tar = "0.4"

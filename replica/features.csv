@@ -1,0 +1,44 @@
+feature,area,priority,original,clone,notes
+Workspaces (create/list/settings),core,must,yes,yes,"create, list, rename, description, default auto-apply, delete (typed-name confirmation; refused while locked or running), lock, variables, state list; no Terraform version pin, tags or project grouping (separate features); one organization per user in the UI"
+Remote state storage with versions,state,must,yes,partial,"versions in PostgreSQL, encrypted, survive restart; also pushed by the tofu http backend (monotonic serial, one lineage, Content-MD5 checked); single-use 5-minute download and upload URLs (the API never returns the state inline); no retention policy; the URLs live in one server's memory, so they do not work across instances or restarts"
+State locking (lock/unlock/force-unlock),state,must,yes,yes,"manual, run and CLI locks exclude each other; tofu force-unlock works for all three; force-unlock ends the run that held the lock; leases that lapse on their own plus a heartbeat (API 1 h default, CLI 12 h because tofu cannot renew); not done: the original's rule that unlock waits while the latest state version is pending"
+Run queue per workspace (FIFO),runs,must,yes,yes,"one active run per workspace; oldest first, one executing run per workspace; concurrency test passes"
+Run lifecycle state machine,runs,must,yes,partial,"11 of about 24 states (force_canceled added); no policy, cost, task or fetch states"
+Speculative plan (plan-only),runs,must,yes,yes,"no apply possible; never locks, can never be applied"
+Confirm / discard / cancel run actions,runs,must,yes,yes,"confirm and discard when paused; cancel stops the engine step (pending, planning, apply queued); force-cancel for an applying run: admin only, explicit acknowledgement, engine asked to stop so its state is kept, then killed after a grace period; no force-execute"
+Live plan/apply log streaming,runs,must,yes,yes,"Server-Sent Events with resume (Last-Event-ID), secrets masked, per-stage durations; polls the store ~7 times a second per viewer (single instance); no ANSI colour"
+Plan diff view per resource,runs,should,yes,partial,resource list with action; no attribute-level diff
+Variables (terraform/env/sensitive/hcl),config,must,yes,partial,"input and environment variables, sensitive write-only, masked in logs; hcl flag not interpreted; no variable sets"
+Run-level variable overrides,config,should,yes,no,
+Configuration versions + upload,runs,must,yes,partial,"text configuration (1 MB) or a .tar.gz uploaded in two steps like the original (create a version, PUT the archive); only .tf files at the top of the archive: no modules in subdirectories, no .tf.json"
+VCS-driven runs (webhook to run),vcs,should,yes,no,GitHub first
+Tokens (user/team/org),auth,must,yes,partial,user and organization tokens with expiry and revoke; organization token cannot plan or apply; no team tokens
+REST API JSON:API /api/v2,api,must,yes,yes,"resource objects with relationships and links, include, paged lists, JSON:API errors and requests; covers the resources the product has (workspaces, runs, state versions, variables, configuration versions, tokens); the original has many more resource types"
+Pagination and include,api,should,yes,yes,"page[number]/page[size] default 20 max 100, links and meta; include on workspaces and runs; token list not paged yet"
+Rate limiting 30 req/s per user,api,should,yes,yes,"30 per second per user (organization tokens share their organization's), 429 with Retry-After, TF_API_RATE to change or turn off; fixed one-second window: a burst across a window edge can reach twice the limit"
+Projects (grouping and scoped access),org,should,yes,no,paid tier in original
+Teams and role permissions,auth,should,yes,partial,"owner/admin/member through one can() function; no teams, no invite screen"
+Policy as code (own format),policy,should,yes,no,advisory / soft / hard levels with override
+Cost estimation,policy,could,yes,no,
+Run tasks (external hooks pre/post),runs,could,yes,no,
+Notifications (webhook/email/Slack),ops,could,yes,no,guess; page not read
+Drift detection / continuous validation,ops,should,yes,no,paid tier in original
+Agents / self-hosted runners,ops,should,yes,no,guess on details
+State encryption at rest,security,must,yes,partial,"AES-256-GCM, key per workspace, master key from environment; no KMS key providers, no rotation"
+Plan file encryption,security,should,yes,yes,saved plans sealed with run-bound key
+State rollback,state,should,yes,no,duplicates old version as current
+Audit logging,security,should,yes,no,paid tier in original
+CLI login and remote backend protocol,cli,must,yes,partial,"OpenTofu http backend implemented and verified with the real tofu 1.13.9 (init, plan, apply, destroy, state list, output, locking, force-unlock); not the cloud block, no `tofu login`, no remote runs from the CLI"
+Engine: HCL parse + evaluate,engine,must,yes,partial,"works through the real tofu binary (verified with 1.13.9 on Windows and Linux, in a process or container sandbox); the simulator is the default; a native Rust evaluator is not started"
+Engine: dependency graph plan/apply,engine,must,yes,partial,"done by the tofu binary (plan, saved plan, apply, destroy verified); no native Rust graph engine"
+Engine: provider plugin protocol,engine,must,yes,partial,providers are run by the tofu binary; only the built-in terraform_data provider was exercised (no registry downloads were tested); container mode has no network by default
+Private module/provider registry,registry,could,yes,no,
+Sentinel policy language,policy,could,yes,skip,proprietary; use own format
+Public provider registry content,registry,could,yes,skip,owned by third parties
+HashiCorp branding / docs text,legal,could,yes,skip,trademark and copyright
+Hosted run infrastructure and user network,ops,could,yes,skip,not clonable
+Lint in the plan step (HCL parse + rules),runs,should,no,no,"fix P1 in fixes.md: 211 votes on OpenTofu issue 2213; an improvement over the original"
+Pull-request plan comment with lock until merge,vcs,should,no,no,"fix P2: Atlantis-style flow; 57 keyword matches (about half real); needs the VCS webhook row first"
+Scheduled refresh-only drift runs + skip refresh of unchanged resources,runs,should,no,no,"fix P3: 131 + 31 votes on OpenTofu issues 1703 and 4372; drift detection is a paid feature of the original"
+Shared provider and module cache between runs,engine,could,no,no,"fix P4: 62 votes on OpenTofu issue 1199"
+Ordered multi-workspace apply (stack),runs,should,no,no,"fix P5: 202 votes on OpenTofu issue 931; not checked whether HCP Terraform Stacks already covers it (page not read)"

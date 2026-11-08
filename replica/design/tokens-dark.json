@@ -1,0 +1,122 @@
+{
+  "_about": "Dark values, same roles. Check with contrast.py",
+  "color": {
+    "bg": "#0e1115",
+    "surface": "#151a20",
+    "surface-raised": "#1b2129",
+    "border": "#272e37",
+    "border-input": "#8691a0",
+    "text": "#e8ebef",
+    "text-muted": "#a1abb8",
+    "accent": "#4fd1c0",
+    "on-accent": "#04201c",
+    "accent-bg": "#10302c",
+    "danger": "#ff9090",
+    "danger-bg": "#3a1a1a",
+    "success": "#6fd69b",
+    "success-bg": "#14301f",
+    "warning": "#f0b45a",
+    "warning-bg": "#35280f",
+    "info": "#7fb9ee",
+    "info-bg": "#12283d",
+    "neutral-bg": "#232932",
+    "diff-add-bg": "#14301f",
+    "diff-chg-bg": "#35280f",
+    "diff-del-bg": "#3a1a1a",
+    "log-bg": "#0e1115",
+    "log-text": "#e4e7eb",
+    "log-muted": "#98a2b0"
+  },
+  "pairs": [
+    [
+      "text",
+      "bg"
+    ],
+    [
+      "text",
+      "surface"
+    ],
+    [
+      "text-muted",
+      "bg"
+    ],
+    [
+      "text-muted",
+      "surface"
+    ],
+    [
+      "on-accent",
+      "accent"
+    ],
+    [
+      "accent",
+      "bg"
+    ],
+    [
+      "accent",
+      "surface"
+    ],
+    [
+      "accent",
+      "accent-bg"
+    ],
+    [
+      "danger",
+      "bg"
+    ],
+    [
+      "danger",
+      "danger-bg"
+    ],
+    [
+      "success",
+      "bg"
+    ],
+    [
+      "success",
+      "success-bg"
+    ],
+    [
+      "warning",
+      "warning-bg"
+    ],
+    [
+      "info",
+      "info-bg"
+    ],
+    [
+      "text",
+      "neutral-bg"
+    ],
+    [
+      "text",
+      "diff-add-bg"
+    ],
+    [
+      "text",
+      "diff-chg-bg"
+    ],
+    [
+      "text",
+      "diff-del-bg"
+    ],
+    [
+      "log-text",
+      "log-bg"
+    ],
+    [
+      "log-muted",
+      "log-bg"
+    ],
+    [
+      "border-input",
+      "bg",
+      "ui"
+    ],
+    [
+      "accent",
+      "bg",
+      "ui"
+    ]
+  ]
+}
