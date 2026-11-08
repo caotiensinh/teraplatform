@@ -1,7 +1,3 @@
 /target
 .env*
 !.env.example
-
-# Third-party text collected as research (Hacker News, forum posts); not republished here
-replica/reviews.csv
-replica/reviews-dropped-jobads.csv
