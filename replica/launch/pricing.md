@@ -71,7 +71,7 @@ The research mostly complains about the *model* (per resource), not about cancel
 ## What is real today (this decides what may be sold)
 
 - **Built:** lint in the plan step (nine rules, never blocks), drift checks on a schedule or on request, accounts and roles, workspaces and settings, state with locks and leases, plan / confirm / apply with a real `tofu` in a sandbox, live logs, force-cancel, the JSON:API, the OpenTofu http backend, archive upload, rate limit.
-- **Not built, so not for sale:** pull-request plans (fix P2 in `fixes.md`; P1 lint and P3 drift checks are built, but drift has not been run against a real cloud provider yet), runner agents, SSO, audit log, billing itself, and a hosted service. There is no Stripe code and no seat or run counting in the product. **Until those exist the honest offer is a free self-hosted beta**; the table above becomes true feature by feature, and a tier should not be charged for a row marked planned.
+- **Built, not yet proven live:** pull-request plans with comments (fix P2), lint (P1) and drift checks (P3). Drift has not been run against a real cloud provider, and the pull-request flow has not seen a real signed delivery from GitHub., runner agents, SSO, audit log, billing itself, and a hosted service. There is no Stripe code and no seat or run counting in the product. **Until those exist the honest offer is a free self-hosted beta**; the table above becomes true feature by feature, and a tier should not be charged for a row marked planned.
 - The users limit and the concurrent-run limit need counting code in the server before they can be enforced.
 
 ## Stripe objects to create (the owner creates them, after the code exists)

@@ -318,15 +318,74 @@ pub struct Run {
     /// Always a speculative run (it takes no lock and cannot be applied).
     #[serde(default)]
     pub refresh_only: bool,
+    /// The commit and pull request this run was made from, if it came from a repository.
+    #[serde(default)]
+    pub vcs: Option<VcsOrigin>,
     pub created_at: u64,
     pub updated_at: u64,
 }
 
 /// How a run differs from a plain plan.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunOptions {
     pub skip_refresh: bool,
     pub refresh_only: bool,
+    /// The commit (and pull request) this run was made from, when it came from a repository.
+    pub vcs: Option<VcsOrigin>,
+}
+
+/// Where a run's configuration came from in a version control system.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VcsOrigin {
+    /// `owner/name`.
+    pub repo: String,
+    pub sha: String,
+    /// The pull request, when the run plans one; `None` for a push to the tracked branch.
+    pub pr: Option<u64>,
+}
+
+/// A workspace's connection to a repository. The webhook secret and the access token are kept sealed
+/// and never appear here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VcsLink {
+    pub workspace_id: Id,
+    /// `owner/name` on GitHub.
+    pub repo: String,
+    /// A push to this branch queues a run that applies; other branches are only planned through pull requests.
+    pub branch: String,
+    /// The folder of the repository that holds the configuration; empty: the root.
+    pub working_dir: String,
+    pub has_token: bool,
+    pub created_at: u64,
+}
+
+/// A link with its secrets in the clear. Only the server's own code may hold one.
+#[derive(Debug, Clone)]
+pub struct VcsCredentials {
+    pub link: VcsLink,
+    pub webhook_secret: String,
+    pub token: Option<String>,
+}
+
+fn plain_path_chars(s: &str) -> bool {
+    s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'))
+}
+
+/// `owner/name` as GitHub spells it.
+pub fn valid_repo(r: &str) -> bool {
+    let mut parts = r.split('/');
+    let (Some(o), Some(n), None) = (parts.next(), parts.next(), parts.next()) else { return false };
+    let ok = |p: &str| !p.is_empty() && p.len() <= 100 && p != "." && p != ".." && p.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    ok(o) && ok(n)
+}
+
+pub fn valid_branch(b: &str) -> bool {
+    !b.is_empty() && b.len() <= 200 && plain_path_chars(b) && !b.starts_with(['-', '/']) && !b.ends_with(['/', '.']) && !b.contains("..") && !b.contains("//")
+}
+
+/// A relative folder inside the repository, or empty.
+pub fn valid_working_dir(d: &str) -> bool {
+    d.is_empty() || (d.len() <= 200 && plain_path_chars(d) && !d.starts_with(['/', '-']) && !d.split('/').any(|c| c == ".." || c == "."))
 }
 
 /// The outcome of the latest drift check of a workspace.

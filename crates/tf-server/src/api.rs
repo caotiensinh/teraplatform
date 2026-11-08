@@ -256,7 +256,7 @@ pub async fn create_run(
         Some("plan_only") | Some("refresh_only") => Operation::PlanOnly,
         Some(o) => return Err(StoreError::Invalid(format!("unknown operation {o}")).into()),
     };
-    let opts = RunOptions { skip_refresh: b.refresh == Some(false), refresh_only: b.operation.as_deref() == Some("refresh_only") };
+    let opts = RunOptions { skip_refresh: b.refresh == Some(false), refresh_only: b.operation.as_deref() == Some("refresh_only"), vcs: None };
     let run = match (&b.config, &b.configuration_version_id) {
         (Some(c), None) => queue_run(&st.store, &ws, c, &b.message, op, auto_apply, "api", opts).await?,
         (None, Some(cv)) => queue_run_on(&st.store, &ws, cv, &b.message, op, auto_apply, "api", opts).await?,
@@ -544,6 +544,60 @@ pub async fn upload_config_version(
     let text = crate::archive::extract_config(&body, crate::MAX_CONFIG_BYTES).map_err(StoreError::Invalid)?;
     let cv = st.store.upload_config(&id, &text).await?;
     Ok(ja::ok(ja::single(cv_res(&cv), vec![])))
+}
+
+// ---------- repository connection ----------
+
+#[derive(Deserialize)]
+pub struct VcsBody {
+    pub repo: String,
+    #[serde(default = "main_branch")]
+    pub branch: String,
+    #[serde(default)]
+    pub working_directory: String,
+    /// The access token used to download the repository and comment on pull requests. Left out: the
+    /// one already stored stays.
+    #[serde(default)]
+    pub token: Option<String>,
+}
+
+fn main_branch() -> String {
+    "main".into()
+}
+
+fn vcs_res(st: &AppState, link: &VcsLink) -> Value {
+    let r = ja::resource("vcs-connections", link, &["workspace_id", "working_dir"], &[("workspace", "workspaces", Some(&link.workspace_id))], "/api/v2/workspaces");
+    let r = ja::with_attr(r, "working-directory", json!(link.working_dir));
+    let r = ja::with_attr(r, "webhook-url", json!(format!("{}/webhooks/github/{}", st.cfg.base_url.trim_end_matches('/'), link.workspace_id)));
+    let mut r = r;
+    r["id"] = json!(link.workspace_id);
+    r["links"]["self"] = json!(format!("/api/v2/workspaces/{}/vcs", link.workspace_id));
+    r
+}
+
+/// Connects the workspace to a repository. The answer carries the webhook secret **once**
+/// (`meta.webhook-secret`); connecting again makes a new one.
+pub async fn put_vcs(State(st): State<AppState>, Extension(p): Extension<Principal>, Path(id): Path<String>, ApiJson(body): ApiJson<Value>) -> Result<Doc, ApiError> {
+    ws_access(&st, &p, &id, Action::UpdateWorkspace).await?;
+    let b: VcsBody = ja::attributes(body, "vcs-connections")?;
+    let (link, secret) = st.store.set_vcs_link(&id, &b.repo, &b.branch, &b.working_directory, b.token.as_deref()).await?;
+    let mut doc = ja::single(vcs_res(&st, &link), vec![]);
+    doc["meta"] = json!({ "webhook-secret": secret });
+    Ok(ja::ok(doc))
+}
+
+pub async fn get_vcs(State(st): State<AppState>, Extension(p): Extension<Principal>, Path(id): Path<String>) -> ApiResult {
+    ws_access(&st, &p, &id, Action::Read).await?;
+    match st.store.get_vcs_link(&id).await? {
+        Some(link) => Ok(ja::ok(ja::single(vcs_res(&st, &link), vec![]))),
+        None => Err(StoreError::NotFound("this workspace is not connected to a repository".into()).into()),
+    }
+}
+
+pub async fn delete_vcs(State(st): State<AppState>, Extension(p): Extension<Principal>, Path(id): Path<String>) -> Result<StatusCode, ApiError> {
+    ws_access(&st, &p, &id, Action::UpdateWorkspace).await?;
+    st.store.delete_vcs_link(&id).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // ---------- rate limit ----------

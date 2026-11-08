@@ -93,12 +93,17 @@ async fn still_running(store: &Arc<dyn Store>, run: &Run, want: RunStatus) -> bo
 }
 
 pub fn spawn(store: Arc<dyn Store>, engine: Arc<dyn Engine>, cancels: Cancels) -> JoinHandle<()> {
+    spawn_with(store, engine, cancels, None)
+}
+
+/// Like `spawn`, and also reports finished pull-request plans through `reporter`.
+pub fn spawn_with(store: Arc<dyn Store>, engine: Arc<dyn Engine>, cancels: Cancels, reporter: Option<crate::github::Reporter>) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             match store.claim_next().await {
                 Ok(Some(claim)) => {
-                    let (s, e, c) = (store.clone(), engine.clone(), cancels.clone());
-                    tokio::spawn(async move { execute(s, e, c, claim).await });
+                    let (s, e, c, r) = (store.clone(), engine.clone(), cancels.clone(), reporter.clone());
+                    tokio::spawn(async move { execute_with(s, e, c, r, claim).await });
                 }
                 Ok(None) => tokio::time::sleep(Duration::from_millis(50)).await,
                 Err(e) => {
@@ -138,8 +143,12 @@ fn sink(store: &Arc<dyn Store>, run_id: &str, secrets: Vec<String>) -> (Log, Joi
 }
 
 pub async fn execute(store: Arc<dyn Store>, engine: Arc<dyn Engine>, cancels: Cancels, claim: Claim) {
+    execute_with(store, engine, cancels, None, claim).await
+}
+
+pub async fn execute_with(store: Arc<dyn Store>, engine: Arc<dyn Engine>, cancels: Cancels, reporter: Option<crate::github::Reporter>, claim: Claim) {
     match claim {
-        Claim::Plan(run) => plan(store, engine, cancels, run).await,
+        Claim::Plan(run) => plan(store, engine, cancels, reporter, run).await,
         Claim::Apply(run) => apply(store, engine, cancels, run).await,
     }
 }
@@ -204,7 +213,7 @@ async fn lint_step(store: &Arc<dyn Store>, run: &Run, config: &str, secrets: &[S
     let _ = store.set_lint(&run.id, findings).await;
 }
 
-async fn plan(store: Arc<dyn Store>, engine: Arc<dyn Engine>, cancels: Cancels, run: Run) {
+async fn plan(store: Arc<dyn Store>, engine: Arc<dyn Engine>, cancels: Cancels, reporter: Option<crate::github::Reporter>, run: Run) {
     // Register first, then look at the status: a cancel either sees the registration or has
     // already changed the status, so no cancel is lost.
     let token = cancels.register(&run.id);
@@ -235,10 +244,15 @@ async fn plan(store: Arc<dyn Store>, engine: Arc<dyn Engine>, cancels: Cancels, 
             if run.refresh_only {
                 crate::drift::record(&store, &run, Some(&out.summary)).await;
             }
+            let summary = out.summary.clone();
             let _ = store.set_plan(&run.id, out.summary, out.changes, out.blob).await;
             let ev = Event::PlanOk { has_changes, auto_apply: run.auto_apply, plan_only: run.operation == Operation::PlanOnly };
             // Err means the run was canceled meanwhile: nothing more to do.
-            let _ = store.apply_event(&run.id, ev).await;
+            if store.apply_event(&run.id, ev).await.is_ok() {
+                if let Some(r) = &reporter {
+                    r.plan_finished(&store, &run, Some(&summary)).await;
+                }
+            }
         }
         // The status was already changed by whoever canceled; just say what happened.
         Err(EngineError::Canceled { .. }) => note(&store, &run.id, &inp.secrets, "The run was canceled and its planning step was stopped.").await,
@@ -247,7 +261,11 @@ async fn plan(store: Arc<dyn Store>, engine: Arc<dyn Engine>, cancels: Cancels, 
             if run.refresh_only {
                 crate::drift::record(&store, &run, None).await;
             }
-            let _ = store.apply_event(&run.id, Event::PlanFail).await;
+            if store.apply_event(&run.id, Event::PlanFail).await.is_ok() {
+                if let Some(r) = &reporter {
+                    r.plan_finished(&store, &run, None).await;
+                }
+            }
         }
     }
 }

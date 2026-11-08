@@ -197,6 +197,23 @@ pub fn random_token(prefix: &str) -> String {
     format!("{prefix}{}", hex(&b))
 }
 
+/// HMAC-SHA256 of `msg` under `key`.
+pub fn hmac_sha256(key: &[u8], msg: &[u8]) -> Vec<u8> {
+    use hmac::{Hmac, Mac};
+    let mut m = <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC accepts keys of any length");
+    m.update(msg);
+    m.finalize().into_bytes().to_vec()
+}
+
+/// Does `claimed_hex` (a lowercase or uppercase hex string) equal the HMAC-SHA256 of `msg` under
+/// `key`? Compared in constant time; anything that is not valid hex is simply `false`.
+pub fn hmac_sha256_matches(key: &[u8], msg: &[u8], claimed_hex: &str) -> bool {
+    match unhex(&claimed_hex.to_ascii_lowercase()) {
+        Some(claimed) => ct_eq(&hmac_sha256(key, msg), &claimed),
+        None => false,
+    }
+}
+
 /// Constant-time comparison for secrets.
 pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
@@ -208,6 +225,35 @@ pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hmac_matches_the_rfc_4231_vectors() {
+        assert_eq!(hex(&hmac_sha256(&[0x0b; 20], b"Hi There")), "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7");
+        assert_eq!(
+            hex(&hmac_sha256(b"Jefe", b"what do ya want for nothing?")),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+        // a key longer than the block size is hashed first (vector 6)
+        assert_eq!(
+            hex(&hmac_sha256(&[0xaa; 131], b"Test Using Larger Than Block-Size Key - Hash Key First")),
+            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
+        );
+    }
+
+    #[test]
+    fn a_claimed_hmac_is_checked_in_full_and_never_panics() {
+        let good = hex(&hmac_sha256(b"secret", b"payload"));
+        assert!(hmac_sha256_matches(b"secret", b"payload", &good));
+        assert!(hmac_sha256_matches(b"secret", b"payload", &good.to_uppercase()), "hex case does not matter");
+        assert!(!hmac_sha256_matches(b"other", b"payload", &good), "wrong key");
+        assert!(!hmac_sha256_matches(b"secret", b"payload!", &good), "wrong message");
+        let mut flipped = good.clone();
+        flipped.replace_range(0..1, if good.starts_with('0') { "1" } else { "0" });
+        assert!(!hmac_sha256_matches(b"secret", b"payload", &flipped), "one digit off");
+        for bad in ["", "zz", "abc", &good[..62], &format!("{good}00"), "sha256=".to_string().as_str()] {
+            assert!(!hmac_sha256_matches(b"secret", b"payload", bad), "{bad:?}");
+        }
+    }
 
     #[test]
     fn round_trip_and_format() {

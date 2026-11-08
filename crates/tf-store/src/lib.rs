@@ -139,6 +139,17 @@ pub trait Store: Send + Sync {
     /// Internal use by the runner: every value, decrypted.
     async fn variables_for_run(&self, ws: &str) -> Result<Vec<Variable>>;
 
+    // ---- repository link ----
+    /// Connects a workspace to a repository (replacing any earlier connection) and makes a **new**
+    /// webhook secret, returned here and never again. `token` is the access token used to fetch the
+    /// repository and to comment on pull requests; `None` keeps the one already stored, if any.
+    async fn set_vcs_link(&self, ws: &str, repo: &str, branch: &str, working_dir: &str, token: Option<&str>) -> Result<(VcsLink, String)>;
+    async fn get_vcs_link(&self, ws: &str) -> Result<Option<VcsLink>>;
+    /// Internal use by the webhook and the runner: the link with its secrets, decrypted.
+    async fn vcs_credentials(&self, ws: &str) -> Result<Option<VcsCredentials>>;
+    /// Disconnects. NotFound when there was no connection.
+    async fn delete_vcs_link(&self, ws: &str) -> Result<()>;
+
     // ---- runs ----
     /// A plain run: see `create_run_with` for the options.
     async fn create_run(
@@ -243,6 +254,8 @@ macro_rules! all_contract_tests {
             a_workspace_is_deleted_with_everything_in_it,
             a_single_state_version_can_be_fetched,
             lint_findings_are_kept_with_the_run,
+            a_repository_link_keeps_its_secrets_and_rotates_the_webhook_secret,
+            a_run_remembers_the_commit_and_pull_request_it_came_from,
             run_options_are_kept_and_a_drift_check_must_be_speculative,
             drift_checks_fall_due_by_their_interval,
             the_latest_configuration_is_one_that_has_its_content,

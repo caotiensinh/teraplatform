@@ -13,7 +13,21 @@ use tar::EntryType;
 /// Most the archive may unpack to, summed over every entry, before it is refused.
 const MAX_UNPACKED: u64 = 20_000_000;
 
+/// How an archive is laid out.
+#[derive(Debug, Clone, Default)]
+pub struct ExtractOptions {
+    /// Every entry sits inside one top folder (as in a GitHub tarball, `owner-repo-sha/...`): drop it.
+    pub strip_top: bool,
+    /// Only the files under this folder (after the top folder is dropped) are the configuration,
+    /// and they count as the archive's top level. Empty: the whole archive.
+    pub subdir: String,
+}
+
 pub fn extract_config(gz: &[u8], max_config: usize) -> Result<String, String> {
+    extract_config_with(gz, max_config, &ExtractOptions::default())
+}
+
+pub fn extract_config_with(gz: &[u8], max_config: usize, opts: &ExtractOptions) -> Result<String, String> {
     if gz.is_empty() {
         return Err("the upload is empty".into());
     }
@@ -27,12 +41,24 @@ pub fn extract_config(gz: &[u8], max_config: usize) -> Result<String, String> {
         let mut entry = entry.map_err(|_| "the upload is not a valid .tar.gz archive".to_string())?;
         let kind = entry.header().entry_type();
         let raw_path = entry.path().map_err(|_| "an entry has an unreadable path".to_string())?.to_string_lossy().replace('\\', "/");
-        let path = raw_path.trim_start_matches("./").to_string();
+        let mut path = raw_path.trim_start_matches("./").to_string();
         if path.is_empty() || path == "." {
             continue;
         }
         if path.starts_with('/') || path.split('/').any(|c| c == "..") {
             return Err(format!("the archive has an unsafe path: {raw_path}"));
+        }
+        if opts.strip_top {
+            match path.split_once('/') {
+                Some((_, rest)) if !rest.is_empty() => path = rest.to_string(),
+                _ => continue, // the top folder itself
+            }
+        }
+        if !opts.subdir.is_empty() {
+            match path.strip_prefix(&format!("{}/", opts.subdir.trim_matches('/'))) {
+                Some(rest) if !rest.is_empty() => path = rest.to_string(),
+                _ => continue, // outside the folder that holds the configuration
+            }
         }
         match kind {
             EntryType::Directory | EntryType::XGlobalHeader | EntryType::XHeader => continue,
@@ -134,6 +160,40 @@ pub mod tests {
         let mut gz = GzEncoder::new(Vec::new(), Compression::default());
         gz.write_all(&tar.into_inner().unwrap()).unwrap();
         extract_config(&gz.finish().unwrap(), 1000).unwrap_err()
+    }
+
+    #[test]
+    fn a_github_style_archive_is_read_from_inside_its_top_folder_and_subfolder() {
+        let a = make(&[
+            ("acme-infra-1a2b3c/main.tf", "resource \"a\" \"x\" {}
+"),
+            ("acme-infra-1a2b3c/README.md", "ignored"),
+            ("acme-infra-1a2b3c/envs/prod/main.tf", "resource \"p\" \"y\" {}
+"),
+            ("acme-infra-1a2b3c/envs/prod/vars.tf", "variable \"v\" {}
+"),
+            ("acme-infra-1a2b3c/envs/dev/main.tf", "resource \"d\" \"z\" {}
+"),
+        ]);
+        // without stripping, the files are one folder down: subdirectories are not supported
+        assert!(extract_config(&a, 1_000_000).unwrap_err().contains("subdirectories"));
+        let top = extract_config_with(&a, 1_000_000, &ExtractOptions { strip_top: true, subdir: String::new() });
+        assert!(top.unwrap_err().contains("subdirectories"), "envs/prod is nested in the repository root");
+        let root = make(&[("acme-infra-1a2b3c/main.tf", "resource \"a\" \"x\" {}
+"), ("acme-infra-1a2b3c/README.md", "r")]);
+        assert_eq!(extract_config_with(&root, 1_000_000, &ExtractOptions { strip_top: true, subdir: String::new() }).unwrap(), "# file: main.tf
+resource \"a\" \"x\" {}
+");
+        let prod = extract_config_with(&a, 1_000_000, &ExtractOptions { strip_top: true, subdir: "envs/prod".into() }).unwrap();
+        assert_eq!(prod, "# file: main.tf
+resource \"p\" \"y\" {}
+# file: vars.tf
+variable \"v\" {}
+", "only that folder, and only its own files");
+        assert!(!prod.contains("\"d\"") && !prod.contains("\"a\""));
+        // a folder that is not there is the same as an archive with no configuration
+        assert!(extract_config_with(&a, 1_000_000, &ExtractOptions { strip_top: true, subdir: "envs/staging".into() }).unwrap_err().contains("no .tf files"));
+        assert!(extract_config_with(&a, 1_000_000, &ExtractOptions { strip_top: true, subdir: "/envs/prod/".into() }).is_ok(), "slashes around the folder do not matter");
     }
 
     #[test]

@@ -33,6 +33,15 @@ impl Sealer {
         self.0.decrypt("plan", run, text).map_err(|e| fail(&format!("saved plan of run {run}"), e))
     }
 
+    /// The webhook secret (`what` = "webhook") or the access token (`what` = "token") of a workspace's repository link.
+    pub fn seal_vcs(&self, ws: &str, what: &str, value: &str) -> String {
+        self.0.encrypt_str("vcs", &format!("{ws}|{what}"), value)
+    }
+
+    pub fn open_vcs(&self, ws: &str, what: &str, text: &str) -> Result<String> {
+        self.0.decrypt_str("vcs", &format!("{ws}|{what}"), text).map_err(|e| fail(&format!("repository {what} of workspace {ws}"), e))
+    }
+
     fn var_id(ws: &str, category: &str, key: &str) -> String {
         format!("{ws}|{category}|{key}")
     }

@@ -131,3 +131,10 @@ then `cargo clean` and switched the dev profile to `debug = "line-tables-only"`,
 - **Found on the way:** `latest_config` returned a configuration version that was still waiting for its upload (empty text); a drift check would have planned against nothing. Fixed in both stores, with a contract test.
 - Limits stated in `backend.md`: real drift not exercised with a real provider; the 131-vote request (skip refresh only for unchanged resources) is not what a whole-plan switch does.
 - 277 tests (was 259), run on PostgreSQL with the real tofu and Docker cases, none skipped; 14 mutation checks, all turn a test red (one, queuing a check without a state, needed a stronger test first).
+
+## 2026-11-08: pull-request runs (fix P2)
+
+- New: `tf-crypto` HMAC, archive options (strip the top folder, read a folder), `VcsLink` and `VcsOrigin`, `Store::{set,get,delete}_vcs_link` and `vcs_credentials`, run origin (`runs.vcs`), migration `0008`, `github.rs` (webhook, decisions, download, comment), the `Reporter` the runner calls when a pull-request plan ends, the connection API and settings card. HTTP client: `ureq`.
+- Refused on purpose: pull requests from forks.
+- Verified against real github.com once: the tarball download and layout. Not verified: a real signed delivery, posting a real comment.
+- 302 tests (was 277), run on PostgreSQL with the real tofu and Docker cases; the opt-in real-GitHub download test was run once separately; 17 mutation checks, all turn a test red.

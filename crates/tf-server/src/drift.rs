@@ -20,7 +20,7 @@ pub async fn queue_check(store: &Arc<dyn Store>, workspace: &str, source: &str) 
     if store.current_state(workspace).await?.is_none() {
         return Err(StoreError::Conflict("this workspace has no state yet, so there is nothing to refresh".into()));
     }
-    queue_run_on(store, workspace, &cv.id, "drift check", Operation::PlanOnly, false, source, RunOptions { skip_refresh: false, refresh_only: true }).await
+    queue_run_on(store, workspace, &cv.id, "drift check", Operation::PlanOnly, false, source, RunOptions { skip_refresh: false, refresh_only: true, vcs: None }).await
 }
 
 /// Writes the outcome of a finished drift check onto its workspace. `None`: the check failed.

@@ -46,7 +46,7 @@ async fn boot_engine(mut cfg: Config, engine: Arc<dyn Engine>) -> App {
     let mail = Arc::new(CaptureMailer::default());
     let state = tf_server::AppState::new(store.clone(), engine.name(), mail.clone(), cfg);
     let cancels = state.cancels.clone();
-    tf_server::runner::spawn(store.clone(), engine.clone(), cancels.clone());
+    tf_server::runner::spawn_with(store.clone(), engine.clone(), cancels.clone(), Some(state.reporter()));
     tf_server::drift::spawn(&state);
     App { router: tf_server::app(state), store, mail, cancels }
 }
@@ -3176,4 +3176,423 @@ async fn wait_status_for(c: &Client, run: &str, want: &str, tries: u32) -> Value
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!("run {run} never reached {want}");
+}
+
+// ================= P2: pull-request runs through a signed webhook =================
+
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+#[derive(Clone, Default)]
+struct FakeGithub {
+    /// (pull request, comment body, Authorization header) for every comment posted
+    comments: Arc<Mutex<Vec<(u64, String, Option<String>)>>>,
+    /// Authorization header of every tarball download
+    downloads: Arc<Mutex<Vec<Option<String>>>>,
+    /// commit -> files of that commit (path inside the repository -> content); other commits get `default_files`
+    commits: Arc<Mutex<HashMap<String, Vec<(String, String)>>>>,
+    default_files: Arc<Mutex<Vec<(String, String)>>>,
+    refuse_downloads: Arc<std::sync::atomic::AtomicBool>,
+}
+
+const SHA1: &str = "1111111111111111111111111111111111111111";
+const SHA2: &str = "2222222222222222222222222222222222222222";
+const SHA3: &str = "3333333333333333333333333333333333333333";
+
+/// Plays GitHub for the two calls the platform makes. Returns the address to put in `github_api`.
+async fn start_fake_github() -> (String, FakeGithub) {
+    use axum::extract::{Path as P, State as S};
+    use axum::http::HeaderMap;
+    use axum::routing::{get, post};
+    let gh = FakeGithub::default();
+    *gh.default_files.lock().unwrap() = vec![("main.tf".into(), CFG_A.into())];
+
+    async fn tarball(S(gh): S<FakeGithub>, P((_o, _r, sha)): P<(String, String, String)>, h: HeaderMap) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        gh.downloads.lock().unwrap().push(h.get("authorization").and_then(|v| v.to_str().ok()).map(String::from));
+        if gh.refuse_downloads.load(std::sync::atomic::Ordering::SeqCst) {
+            return (StatusCode::NOT_FOUND, "Not Found").into_response();
+        }
+        let files = gh.commits.lock().unwrap().get(&sha).cloned().unwrap_or_else(|| gh.default_files.lock().unwrap().clone());
+        let prefixed: Vec<(String, String)> = files.into_iter().map(|(p, c)| (format!("acme-infra-{}/{}", &sha[..7], p), c)).collect();
+        let refs: Vec<(&str, &str)> = prefixed.iter().map(|(p, c)| (p.as_str(), c.as_str())).collect();
+        ([(header::CONTENT_TYPE, "application/x-gzip")], targz(&refs)).into_response()
+    }
+    async fn comment(S(gh): S<FakeGithub>, P((_o, _r, n)): P<(String, String, u64)>, h: HeaderMap, body: String) -> StatusCode {
+        let text = serde_json::from_str::<Value>(&body).ok().and_then(|v| v["body"].as_str().map(String::from)).unwrap_or_default();
+        gh.comments.lock().unwrap().push((n, text, h.get("authorization").and_then(|v| v.to_str().ok()).map(String::from)));
+        StatusCode::CREATED
+    }
+    let app = axum::Router::new()
+        .route("/repos/{owner}/{repo}/tarball/{sha}", get(tarball))
+        .route("/repos/{owner}/{repo}/issues/{n}/comments", post(comment))
+        .with_state(gh.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), gh)
+}
+
+async fn boot_github() -> (App, FakeGithub) {
+    let (api, gh) = start_fake_github().await;
+    let app = boot_with(Config { github_api: api, ..Config::default() }).await;
+    (app, gh)
+}
+
+fn signature(secret: &str, body: &str) -> String {
+    format!("sha256={}", tf_crypto::hex(&tf_crypto::hmac_sha256(secret.as_bytes(), body.as_bytes())))
+}
+
+impl Client {
+    /// A delivery as GitHub sends it: no login, an event name, and a signature over the body.
+    async fn deliver(&self, ws: &str, event: &str, body: &Value, secret: &str) -> Reply {
+        let text = body.to_string();
+        self.deliver_signed(ws, event, &text, Some(&signature(secret, &text))).await
+    }
+
+    async fn deliver_signed(&self, ws: &str, event: &str, text: &str, sig: Option<&str>) -> Reply {
+        let mut b = Request::builder().method(Method::POST).uri(format!("/webhooks/github/{ws}")).header(header::HOST, "localhost").header(header::CONTENT_TYPE, "application/json").header("x-github-event", event);
+        if let Some(s) = sig {
+            b = b.header("x-hub-signature-256", s);
+        }
+        let resp = self.router.clone().oneshot(b.body(Body::from(text.to_string())).unwrap()).await.unwrap();
+        let (status, headers) = (resp.status(), resp.headers().clone());
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        Reply { status, headers, body: String::from_utf8_lossy(&body).to_string() }
+    }
+}
+
+fn pr_event(action: &str, number: u64, sha: &str, head_repo: &str) -> Value {
+    json!({ "action": action, "repository": { "full_name": "acme/infra" },
+        "pull_request": { "number": number, "title": "Add a bucket", "head": { "sha": sha, "repo": { "full_name": head_repo } } } })
+}
+
+fn push_event(branch: &str, sha: &str) -> Value {
+    json!({ "ref": format!("refs/heads/{branch}"), "after": sha, "deleted": false, "repository": { "full_name": "acme/infra" } })
+}
+
+/// Connects a fresh workspace to acme/infra and returns (workspace id, webhook secret).
+async fn connect_repo(c: &Client, name: &str, token: Option<&str>, dir: &str) -> (String, String) {
+    let ws = new_ws(c, name).await;
+    let mut attrs = json!({ "repo": "acme/infra", "branch": "main", "working-directory": dir });
+    if let Some(t) = token {
+        attrs["token"] = json!(t);
+    }
+    let r = c.send(Method::PUT, &format!("/api/v2/workspaces/{ws}/vcs"), Some("application/vnd.api+json"), json!({ "data": { "type": "vcs-connections", "attributes": attrs } }).to_string()).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    let secret = r.json()["meta"]["webhook-secret"].as_str().expect("the secret is shown once").to_string();
+    (ws, secret)
+}
+
+async fn runs_of(c: &Client, ws: &str) -> Vec<Value> {
+    c.get(&format!("/api/v2/workspaces/{ws}/runs")).await.json()["data"].as_array().unwrap().clone()
+}
+
+async fn wait_for_runs(c: &Client, ws: &str, n: usize) -> Vec<Value> {
+    for _ in 0..300 {
+        let r = runs_of(c, ws).await;
+        if r.len() >= n {
+            return r;
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    panic!("expected {n} run(s) in {ws}; have {}", runs_of(c, ws).await.len());
+}
+
+async fn wait_comments(gh: &FakeGithub, n: usize) -> Vec<(u64, String, Option<String>)> {
+    for _ in 0..300 {
+        let c = gh.comments.lock().unwrap().clone();
+        if c.len() >= n {
+            return c;
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    panic!("expected {n} comment(s); have {:?}", gh.comments.lock().unwrap());
+}
+
+#[tokio::test]
+async fn n01_a_workspace_is_connected_through_the_api_and_the_secret_is_shown_once() {
+    let app = boot().await;
+    let ana = signup(&app, "ana@example.com", "alpha-org").await;
+    let cy = signup(&app, "cy@example.com", "zeta-org").await;
+    make_member(&app, "ana@example.com", "cy@example.com").await;
+    let bo = signup(&app, "bo@example.com", "beta").await;
+    let ws = new_ws(&ana, "prod").await;
+    let uri = format!("/api/v2/workspaces/{ws}/vcs");
+    assert_eq!(ana.get(&uri).await.status, StatusCode::NOT_FOUND, "not connected yet");
+
+    let put = |c: &Client, attrs: Value| {
+        let (c, uri) = (c.clone(), uri.clone());
+        async move { c.send(Method::PUT, &uri, Some("application/json"), attrs.to_string()).await }
+    };
+    let r = put(&ana, json!({ "repo": "acme/infra", "token": "ghp_secrettoken" })).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    let secret = r.json()["meta"]["webhook-secret"].as_str().unwrap().to_string();
+    assert!(secret.starts_with("whsec_"), "{secret}");
+    let a = &r.json()["data"]["attributes"];
+    assert_eq!((a["repo"].clone(), a["branch"].clone(), a["working-directory"].clone(), a["has-token"].clone()), (json!("acme/infra"), json!("main"), json!(""), json!(true)), "branch defaults to main");
+    assert_eq!(a["webhook-url"], format!("http://127.0.0.1:8080/webhooks/github/{ws}"));
+    assert!(!r.body.contains("ghp_secrettoken"), "the token is never echoed");
+
+    let g = ana.get(&uri).await;
+    assert_eq!(g.status, StatusCode::OK);
+    assert!(!g.body.contains(&secret) && !g.body.contains("ghp_secrettoken") && g.json().get("meta").is_none(), "reading never shows a secret: {}", g.body);
+
+    // connecting again makes a new secret and keeps the token
+    let second = put(&ana, json!({ "repo": "acme/infra", "branch": "release" })).await;
+    let secret2 = second.json()["meta"]["webhook-secret"].as_str().unwrap().to_string();
+    assert_ne!(secret, secret2);
+    assert_eq!((second.json()["data"]["attributes"]["branch"].clone(), second.json()["data"]["attributes"]["has-token"].clone()), (json!("release"), json!(true)));
+
+    for (what, attrs) in [("no repo", json!({})), ("bad repo", json!({ "repo": "acme" })), ("bad branch", json!({ "repo": "a/b", "branch": "x y" })), ("bad folder", json!({ "repo": "a/b", "working-directory": "../x" })), ("bad token", json!({ "repo": "a/b", "token": "has space" }))] {
+        let r = put(&ana, attrs).await;
+        assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY, "{what}: {}", r.body);
+    }
+    assert_eq!(put(&cy, json!({ "repo": "acme/infra" })).await.status, StatusCode::FORBIDDEN, "members read, owners connect");
+    assert_eq!(cy.get(&uri).await.status, StatusCode::OK);
+    assert_eq!(cy.delete(&uri).await.status, StatusCode::FORBIDDEN);
+    assert_eq!(put(&bo, json!({ "repo": "acme/infra" })).await.status, StatusCode::NOT_FOUND);
+    assert_eq!(bo.get(&uri).await.status, StatusCode::NOT_FOUND);
+
+    assert_eq!(ana.delete(&uri).await.status, StatusCode::NO_CONTENT);
+    assert_eq!(ana.get(&uri).await.status, StatusCode::NOT_FOUND);
+    assert_eq!(ana.delete(&uri).await.status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn n02_only_a_correctly_signed_delivery_is_listened_to() {
+    let (app, _gh) = boot_github().await;
+    let c = signup(&app, "ana@example.com", "acme").await;
+    let anon = Client::anon(&app);
+    let (ws, secret) = connect_repo(&c, "prod", Some("ghp_t"), "").await;
+    let body = pr_event("opened", 7, SHA1, "acme/infra");
+    let text = body.to_string();
+
+    assert_eq!(anon.deliver_signed(&ws, "pull_request", &text, None).await.status, StatusCode::UNAUTHORIZED, "no signature");
+    assert_eq!(anon.deliver_signed(&ws, "pull_request", &text, Some("sha256=00")).await.status, StatusCode::UNAUTHORIZED, "nonsense signature");
+    assert_eq!(anon.deliver_signed(&ws, "pull_request", &text, Some(&text)).await.status, StatusCode::UNAUTHORIZED, "no sha256= prefix");
+    assert_eq!(anon.deliver_signed(&ws, "pull_request", &text, Some(&signature("whsec_wrong", &text))).await.status, StatusCode::UNAUTHORIZED, "wrong secret");
+    assert_eq!(anon.deliver_signed(&ws, "pull_request", &text, Some(&signature(&secret, "{\"other\":1}"))).await.status, StatusCode::UNAUTHORIZED, "a signature for another body");
+    let tampered = text.replace("\"number\":7", "\"number\":8");
+    assert_eq!(anon.deliver_signed(&ws, "pull_request", &tampered, Some(&signature(&secret, &text))).await.status, StatusCode::UNAUTHORIZED, "a body changed after signing");
+    assert!(runs_of(&c, &ws).await.is_empty(), "nothing was queued by any of that");
+
+    assert_eq!(anon.deliver(&ws, "ping", &json!({ "zen": "hi" }), &secret).await.status, StatusCode::OK);
+    let not_json = "not json at all";
+    assert_eq!(anon.deliver_signed(&ws, "pull_request", not_json, Some(&signature(&secret, not_json))).await.status, StatusCode::BAD_REQUEST);
+    // a workspace that is not connected, or does not exist, is the same answer
+    let bare = new_ws(&c, "bare").await;
+    assert_eq!(anon.deliver(&bare, "ping", &json!({}), &secret).await.status, StatusCode::NOT_FOUND);
+    assert_eq!(anon.deliver("no-such-workspace", "ping", &json!({}), &secret).await.status, StatusCode::NOT_FOUND);
+    // the old secret stops working when a new one is made
+    let again = c.send(Method::PUT, &format!("/api/v2/workspaces/{ws}/vcs"), Some("application/json"), json!({ "repo": "acme/infra" }).to_string()).await;
+    let secret2 = again.json()["meta"]["webhook-secret"].as_str().unwrap().to_string();
+    assert_eq!(anon.deliver(&ws, "ping", &json!({}), &secret).await.status, StatusCode::UNAUTHORIZED, "the old secret");
+    assert_eq!(anon.deliver(&ws, "ping", &json!({}), &secret2).await.status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn n03_a_pull_request_is_planned_and_the_result_is_commented_on_it() {
+    let (app, gh) = boot_github().await;
+    let c = signup(&app, "ana@example.com", "acme").await;
+    let anon = Client::anon(&app);
+    let (ws, secret) = connect_repo(&c, "prod", Some("ghp_t"), "").await;
+    *gh.default_files.lock().unwrap() = vec![
+        ("main.tf".into(), CFG_A.into()),
+        ("variables.tf".into(), "variable \"spare\" {\n  type = string\n  description = \"d\"\n}\n".into()),
+        ("README.md".into(), "not configuration".into()),
+    ];
+
+    let r = anon.deliver(&ws, "pull_request", &pr_event("opened", 7, SHA1, "acme/infra"), &secret).await;
+    assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.body);
+    let runs = wait_for_runs(&c, &ws, 1).await;
+    let run = runs[0]["id"].as_str().unwrap().to_string();
+    let v = wait_status(&c, &run, "planned_and_finished").await;
+    let a = &v["data"]["attributes"];
+    assert_eq!((a["source"].clone(), a["operation"].clone(), a["message"].clone()), (json!("github"), json!("plan_only"), json!("PR #7: Add a bucket")));
+    assert_eq!(a["vcs"], json!({ "repo": "acme/infra", "sha": SHA1, "pr": 7 }));
+    assert_eq!(a["summary"]["add"], 2, "both files of the commit were planned");
+    assert!(lock_of(&c, &ws).await.is_null(), "a pull-request plan takes no lock");
+    let log = log_text(&c, &run).await;
+    assert!(log.contains("Fetched acme/infra@1111111"), "{log}");
+    assert!(finding_rules(&v).contains(&"unused-variable".to_string()), "lint ran on the pull request's files too");
+
+    let comments = wait_comments(&gh, 1).await;
+    let (pr, body, auth) = &comments[0];
+    assert_eq!((*pr, auth.as_deref()), (7, Some("Bearer ghp_t")));
+    assert!(body.contains("plan for `1111111`") && body.contains("Plan: 2 to add, 0 to change, 0 to destroy."), "{body}");
+    assert!(body.contains("`+ aws_s3_bucket.logs`") && body.contains("Lint: ") && body.contains("variables.tf:1"), "{body}");
+    assert!(body.contains(&format!("/runs/{run})")), "the comment links to the run: {body}");
+    assert!(!body.contains("ghp_t"), "the token never appears in a comment");
+    assert_eq!(gh.downloads.lock().unwrap().clone(), vec![Some("Bearer ghp_t".to_string())]);
+    assert!(log_text(&c, &run).await.contains("Posted the result on pull request #7."));
+}
+
+#[tokio::test]
+async fn n04_a_redelivery_is_planned_once_and_a_new_commit_is_planned_again() {
+    let (app, gh) = boot_github().await;
+    let c = signup(&app, "ana@example.com", "acme").await;
+    let anon = Client::anon(&app);
+    let (ws, secret) = connect_repo(&c, "prod", Some("ghp_t"), "").await;
+    let ev = pr_event("opened", 7, SHA1, "acme/infra");
+    assert_eq!(anon.deliver(&ws, "pull_request", &ev, &secret).await.status, StatusCode::ACCEPTED);
+    wait_comments(&gh, 1).await;
+    let dup = anon.deliver(&ws, "pull_request", &ev, &secret).await;
+    assert_eq!(dup.status, StatusCode::OK);
+    assert!(dup.body.contains("duplicate"), "{}", dup.body);
+    // the same commit as another pull request is its own plan
+    assert_eq!(anon.deliver(&ws, "pull_request", &pr_event("opened", 8, SHA1, "acme/infra"), &secret).await.status, StatusCode::ACCEPTED);
+    // a new commit on the first
+    assert_eq!(anon.deliver(&ws, "pull_request", &pr_event("synchronize", 7, SHA2, "acme/infra"), &secret).await.status, StatusCode::ACCEPTED);
+    let comments = wait_comments(&gh, 3).await;
+    assert_eq!(comments.len(), 3, "the redelivery added none: {comments:?}");
+    assert_eq!(runs_of(&c, &ws).await.len(), 3);
+    assert_eq!(gh.downloads.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn n05_forks_other_repositories_and_uninteresting_events_are_ignored() {
+    let (app, gh) = boot_github().await;
+    let c = signup(&app, "ana@example.com", "acme").await;
+    let anon = Client::anon(&app);
+    let (ws, secret) = connect_repo(&c, "prod", Some("ghp_t"), "").await;
+    let mut other_repo = pr_event("opened", 7, SHA1, "acme/infra");
+    other_repo["repository"]["full_name"] = json!("acme/elsewhere");
+    for (what, event, body) in [
+        ("a fork", "pull_request", pr_event("opened", 7, SHA1, "mallory/infra")),
+        ("another repository", "pull_request", other_repo),
+        ("a closed pull request", "pull_request", pr_event("closed", 7, SHA1, "acme/infra")),
+        ("a label", "pull_request", pr_event("labeled", 7, SHA1, "acme/infra")),
+        ("a push to another branch", "push", push_event("feature", SHA1)),
+        ("an event the platform does not use", "issues", json!({ "action": "opened" })),
+    ] {
+        let r = anon.deliver(&ws, event, &body, &secret).await;
+        assert_eq!(r.status, StatusCode::ACCEPTED, "{what}: {}", r.body);
+        assert!(r.body.contains("ignored"), "{what}: {}", r.body);
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(runs_of(&c, &ws).await.is_empty() && gh.downloads.lock().unwrap().is_empty() && gh.comments.lock().unwrap().is_empty(), "nothing was fetched, queued or posted");
+}
+
+#[tokio::test]
+async fn n06_a_push_to_the_tracked_branch_queues_a_run_that_waits_for_confirmation() {
+    let (app, gh) = boot_github().await;
+    let c = signup(&app, "ana@example.com", "acme").await;
+    let anon = Client::anon(&app);
+    let (ws, secret) = connect_repo(&c, "prod", Some("ghp_t"), "envs/prod").await;
+    gh.commits.lock().unwrap().insert(
+        SHA3.into(),
+        vec![
+            ("envs/prod/main.tf".into(), "resource \"aws_s3_bucket\" \"prod\" {\n  bucket = \"p\"\n}\n".into()),
+            ("envs/dev/main.tf".into(), "resource \"aws_s3_bucket\" \"dev\" {\n  bucket = \"d\"\n}\nresource \"aws_iam_role\" \"dev\" {\n  name = \"d\"\n}\n".into()),
+            ("main.tf".into(), CFG_A.into()),
+        ],
+    );
+    assert_eq!(anon.deliver(&ws, "push", &push_event("main", SHA3), &secret).await.status, StatusCode::ACCEPTED);
+    let runs = wait_for_runs(&c, &ws, 1).await;
+    let run = runs[0]["id"].as_str().unwrap().to_string();
+    let v = wait_status(&c, &run, "needs_confirmation").await;
+    let a = &v["data"]["attributes"];
+    assert_eq!((a["operation"].clone(), a["message"].clone(), a["vcs"]["pr"].clone()), (json!("plan_and_apply"), json!("push 3333333"), Value::Null));
+    assert_eq!(a["summary"]["add"], 1, "only the configured folder was planned, not the other environment or the root");
+    assert!(!lock_of(&c, &ws).await.is_null(), "a run that will apply holds the lock while it waits");
+    assert_eq!(c.post(&format!("/api/v2/runs/{run}/actions/apply")).await.status, StatusCode::ACCEPTED);
+    wait_status(&c, &run, "applied").await;
+    assert!(gh.comments.lock().unwrap().is_empty(), "a push has no pull request to comment on");
+}
+
+#[tokio::test]
+async fn n07_a_workspace_that_auto_applies_applies_what_is_pushed() {
+    let (app, _gh) = boot_github().await;
+    let c = signup(&app, "ana@example.com", "acme").await;
+    let anon = Client::anon(&app);
+    let (ws, secret) = connect_repo(&c, "prod", None, "").await;
+    c.send(Method::PATCH, &format!("/api/v2/workspaces/{ws}"), Some("application/json"), json!({ "auto-apply": true }).to_string()).await;
+    anon.deliver(&ws, "push", &push_event("main", SHA1), &secret).await;
+    let run = wait_for_runs(&c, &ws, 1).await[0]["id"].as_str().unwrap().to_string();
+    wait_status(&c, &run, "applied").await;
+}
+
+#[tokio::test]
+async fn n08_a_commit_that_cannot_be_fetched_is_reported_on_the_pull_request() {
+    let (app, gh) = boot_github().await;
+    let c = signup(&app, "ana@example.com", "acme").await;
+    let anon = Client::anon(&app);
+    let (ws, secret) = connect_repo(&c, "prod", Some("ghp_t"), "").await;
+    gh.refuse_downloads.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(anon.deliver(&ws, "pull_request", &pr_event("opened", 7, SHA1, "acme/infra"), &secret).await.status, StatusCode::ACCEPTED);
+    let comments = wait_comments(&gh, 1).await;
+    assert!(comments[0].1.contains("could not plan commit `1111111`") && comments[0].1.contains("404"), "{}", comments[0].1);
+    assert!(!comments[0].1.contains("ghp_t"));
+    assert!(runs_of(&c, &ws).await.is_empty(), "no run without a configuration");
+    // and an archive with nothing to plan says why
+    gh.refuse_downloads.store(false, std::sync::atomic::Ordering::SeqCst);
+    *gh.default_files.lock().unwrap() = vec![("README.md".into(), "no terraform here".into())];
+    anon.deliver(&ws, "pull_request", &pr_event("synchronize", 7, SHA2, "acme/infra"), &secret).await;
+    let comments = wait_comments(&gh, 2).await;
+    assert!(comments[1].1.contains("no .tf files"), "{}", comments[1].1);
+}
+
+#[tokio::test]
+async fn n09_without_a_token_a_public_repository_is_planned_and_nothing_is_posted() {
+    let (app, gh) = boot_github().await;
+    let c = signup(&app, "ana@example.com", "acme").await;
+    let anon = Client::anon(&app);
+    let (ws, secret) = connect_repo(&c, "open", None, "").await;
+    assert_eq!(anon.deliver(&ws, "pull_request", &pr_event("opened", 7, SHA1, "acme/infra"), &secret).await.status, StatusCode::ACCEPTED);
+    let run = wait_for_runs(&c, &ws, 1).await[0]["id"].as_str().unwrap().to_string();
+    wait_status(&c, &run, "planned_and_finished").await;
+    assert_eq!(gh.downloads.lock().unwrap().clone(), vec![None], "downloaded without credentials");
+    for _ in 0..20 {
+        if log_text(&c, &run).await.contains("No access token") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(log_text(&c, &run).await.contains("No access token is set"), "the run says why nothing was posted");
+    assert!(gh.comments.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn n10_a_failed_plan_is_reported_and_text_from_the_repository_cannot_mention_anyone() {
+    let (app, gh) = boot_github().await;
+    let c = signup(&app, "ana@example.com", "acme").await;
+    let anon = Client::anon(&app);
+    let (ws, secret) = connect_repo(&c, "prod", Some("ghp_t"), "").await;
+    *gh.default_files.lock().unwrap() = vec![("main.tf".into(), "fail_plan\n".into())];
+    anon.deliver(&ws, "pull_request", &pr_event("opened", 1, SHA1, "acme/infra"), &secret).await;
+    let comments = wait_comments(&gh, 1).await;
+    assert!(comments[0].1.contains("The plan failed."), "{}", comments[0].1);
+
+    *gh.default_files.lock().unwrap() = vec![("main.tf".into(), "resource \"aws_s3_bucket\" \"x@octocat\" {\n  bucket = \"b\"\n}\n".into())];
+    anon.deliver(&ws, "pull_request", &pr_event("opened", 2, SHA2, "acme/infra"), &secret).await;
+    let comments = wait_comments(&gh, 2).await;
+    assert!(comments[1].1.contains("aws_s3_bucket.x@\u{200b}octocat"), "{}", comments[1].1);
+    assert!(!comments[1].1.contains("@octocat"), "nobody is notified by a resource name: {}", comments[1].1);
+}
+
+#[tokio::test]
+async fn n11_the_settings_page_connects_shows_the_secret_once_and_disconnects() {
+    let app = boot().await;
+    let ana = signup(&app, "ana@example.com", "alpha-org").await;
+    let cy = signup(&app, "cy@example.com", "zeta-org").await;
+    make_member(&app, "ana@example.com", "cy@example.com").await;
+    let ws = new_ws(&ana, "prod").await;
+    let page = format!("/workspaces/{ws}/settings");
+    let g = ana.get(&page).await.body;
+    assert!(g.contains("Not connected") && g.contains("name=\"repo\""));
+    assert!(!cy.get(&page).await.body.contains("name=\"repo\""), "members see the card but no form");
+
+    assert_eq!(ana.post_form(&format!("/workspaces/{ws}/vcs"), &[("repo", "not a repo"), ("branch", "main")]).await.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(cy.post_form(&format!("/workspaces/{ws}/vcs"), &[("repo", "acme/infra")]).await.status, StatusCode::FORBIDDEN);
+    let ok = ana.post_form(&format!("/workspaces/{ws}/vcs"), &[("repo", "acme/infra"), ("branch", ""), ("working_dir", "envs/prod"), ("token", "ghp_abc")]).await;
+    assert_eq!(ok.status, StatusCode::OK, "{}", ok.body);
+    assert!(ok.body.contains("whsec_") && ok.body.contains(&format!("/webhooks/github/{ws}")) && ok.body.contains("not shown again"), "{}", ok.body);
+    assert!(!ok.body.contains("ghp_abc"));
+    let after = ana.get(&page).await.body;
+    assert!(after.contains("Connected to") && after.contains("acme/infra") && after.contains("envs/prod") && after.contains("set"), "{after}");
+    assert!(!after.contains("whsec_") && !after.contains("ghp_abc"), "neither secret is on the page again");
+    assert_eq!(ana.post_form(&format!("/workspaces/{ws}/vcs/disconnect"), &[]).await.status, StatusCode::SEE_OTHER);
+    assert!(ana.get(&page).await.body.contains("Not connected"));
+    assert_eq!(ana.post_form(&format!("/workspaces/{ws}/vcs/disconnect"), &[]).await.status, StatusCode::SEE_OTHER, "disconnecting twice is not an error page");
 }

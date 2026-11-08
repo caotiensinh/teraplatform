@@ -330,15 +330,15 @@ pub async fn run_options_are_kept_and_a_drift_check_must_be_speculative(s: S) {
     let (ws, cv) = ws_with_cfg(&s, &o.id, "prod").await;
     let plain = s.create_run(&ws.id, &cv.id, Operation::PlanAndApply, "", false, "t").await.unwrap();
     assert!(!plain.skip_refresh && !plain.refresh_only, "plain runs refresh as usual");
-    let skip = s.create_run_with(&ws.id, &cv.id, Operation::PlanAndApply, "", false, "t", RunOptions { skip_refresh: true, refresh_only: false }).await.unwrap();
+    let skip = s.create_run_with(&ws.id, &cv.id, Operation::PlanAndApply, "", false, "t", RunOptions { skip_refresh: true, refresh_only: false, vcs: None }).await.unwrap();
     assert!(skip.skip_refresh && !skip.refresh_only);
     assert!(s.get_run(&skip.id).await.unwrap().skip_refresh, "kept");
-    let drift = s.create_run_with(&ws.id, &cv.id, Operation::PlanOnly, "drift", false, "schedule", RunOptions { skip_refresh: false, refresh_only: true }).await.unwrap();
+    let drift = s.create_run_with(&ws.id, &cv.id, Operation::PlanOnly, "drift", false, "schedule", RunOptions { skip_refresh: false, refresh_only: true, vcs: None }).await.unwrap();
     assert!(drift.refresh_only && !drift.skip_refresh);
     assert!(s.list_runs(Some(&ws.id)).await.unwrap().iter().any(|r| r.id == drift.id && r.refresh_only), "lists carry it");
     for (what, op, opts) in [
-        ("a refresh-only run that applies", Operation::PlanAndApply, RunOptions { skip_refresh: false, refresh_only: true }),
-        ("a refresh-only run that skips the refresh", Operation::PlanOnly, RunOptions { skip_refresh: true, refresh_only: true }),
+        ("a refresh-only run that applies", Operation::PlanAndApply, RunOptions { skip_refresh: false, refresh_only: true, vcs: None }),
+        ("a refresh-only run that skips the refresh", Operation::PlanOnly, RunOptions { skip_refresh: true, refresh_only: true, vcs: None }),
     ] {
         assert!(matches!(s.create_run_with(&ws.id, &cv.id, op, "", false, "t", opts).await, Err(StoreError::Invalid(_))), "{what}");
     }
@@ -363,7 +363,7 @@ pub async fn drift_checks_fall_due_by_their_interval(s: S) {
     assert!(due(&s).await, "state and an interval, never checked: due now");
 
     // a drift check that is waiting or working holds the next one back
-    let check = s.create_run_with(&ws.id, &cv.id, Operation::PlanOnly, "", false, "schedule", RunOptions { skip_refresh: false, refresh_only: true }).await.unwrap();
+    let check = s.create_run_with(&ws.id, &cv.id, Operation::PlanOnly, "", false, "schedule", RunOptions { skip_refresh: false, refresh_only: true, vcs: None }).await.unwrap();
     assert!(!due(&s).await, "one is already queued");
     s.apply_event(&check.id, Event::Cancel).await.unwrap();
     assert!(due(&s).await, "a canceled check does not count");
@@ -401,6 +401,72 @@ pub async fn the_latest_configuration_is_one_that_has_its_content(s: S) {
     assert_eq!(s.latest_config(&ws.id).await.unwrap().unwrap().id, done.id, "a version still waiting for its archive is not the latest configuration");
     s.upload_config(&waiting.id, "newer").await.unwrap();
     assert_eq!(s.latest_config(&ws.id).await.unwrap().unwrap().id, waiting.id);
+}
+
+pub async fn a_repository_link_keeps_its_secrets_and_rotates_the_webhook_secret(s: S) {
+    let (_, o) = user_and_org(&s, "a").await;
+    let ws = s.create_workspace(&o.id, "prod").await.unwrap();
+    assert!(s.get_vcs_link(&ws.id).await.unwrap().is_none() && s.vcs_credentials(&ws.id).await.unwrap().is_none(), "not connected at first");
+
+    let (link, secret1) = s.set_vcs_link(&ws.id, "acme/infra", "main", "envs/prod", Some("ghp_firsttoken")).await.unwrap();
+    assert_eq!((link.repo.as_str(), link.branch.as_str(), link.working_dir.as_str(), link.has_token), ("acme/infra", "main", "envs/prod", true));
+    assert!(secret1.starts_with("whsec_") && secret1.len() >= 70, "a long random secret: {secret1}");
+    assert_eq!(s.get_vcs_link(&ws.id).await.unwrap().unwrap(), link);
+    let c = s.vcs_credentials(&ws.id).await.unwrap().unwrap();
+    assert_eq!((c.webhook_secret.as_str(), c.token.as_deref()), (secret1.as_str(), Some("ghp_firsttoken")), "decrypted for the server's own use");
+
+    // connecting again makes a new secret, keeps the token when none is given, and tidies the folder
+    let (again, secret2) = s.set_vcs_link(&ws.id, "acme/infra", "release", "/envs/prod/", None).await.unwrap();
+    assert_ne!(secret1, secret2, "the old secret is gone");
+    assert_eq!((again.branch.as_str(), again.working_dir.as_str(), again.has_token), ("release", "envs/prod", true));
+    let c = s.vcs_credentials(&ws.id).await.unwrap().unwrap();
+    assert_eq!((c.webhook_secret, c.token.as_deref()), (secret2, Some("ghp_firsttoken")));
+    let (_, _) = s.set_vcs_link(&ws.id, "acme/infra", "main", "", Some("ghp_second")).await.unwrap();
+    assert_eq!(s.vcs_credentials(&ws.id).await.unwrap().unwrap().token.as_deref(), Some("ghp_second"), "a new token replaces the old");
+
+    // a link without a token (a public repository)
+    let ws2 = s.create_workspace(&o.id, "public").await.unwrap();
+    let (l2, _) = s.set_vcs_link(&ws2.id, "acme/open", "main", "", None).await.unwrap();
+    assert!(!l2.has_token && s.vcs_credentials(&ws2.id).await.unwrap().unwrap().token.is_none());
+
+    // what is refused
+    let bad_repo = ["acme", "acme/", "/infra", "a/b/c", "acme/in fra", "../x", "acme/..", ""];
+    for r in bad_repo {
+        assert!(matches!(s.set_vcs_link(&ws.id, r, "main", "", None).await, Err(StoreError::Invalid(_))), "repo {r:?}");
+    }
+    for b in ["", "-x", "/x", "a..b", "a b", "x/", "a//b", "x.", "ok;rm"] {
+        assert!(matches!(s.set_vcs_link(&ws.id, "acme/infra", b, "", None).await, Err(StoreError::Invalid(_))), "branch {b:?}");
+    }
+    for d in ["../x", "a/../b", "-rf", "a b", "./x"] {
+        assert!(matches!(s.set_vcs_link(&ws.id, "acme/infra", "main", d, None).await, Err(StoreError::Invalid(_))), "dir {d:?}");
+    }
+    for t in ["", "has space", "tab\there", &"x".repeat(300)] {
+        assert!(matches!(s.set_vcs_link(&ws.id, "acme/infra", "main", "", Some(t)).await, Err(StoreError::Invalid(_))), "token {t:?}");
+    }
+    assert_eq!(s.get_vcs_link(&ws.id).await.unwrap().unwrap().branch, "main", "refused input changed nothing");
+    assert!(matches!(s.set_vcs_link("missing", "acme/infra", "main", "", None).await, Err(StoreError::NotFound(_))));
+
+    // disconnecting, and deleting the workspace takes the link with it
+    s.delete_vcs_link(&ws.id).await.unwrap();
+    assert!(s.get_vcs_link(&ws.id).await.unwrap().is_none());
+    assert!(matches!(s.delete_vcs_link(&ws.id).await, Err(StoreError::NotFound(_))));
+    s.delete_workspace(&ws2.id).await.unwrap();
+    let again_ws = s.create_workspace(&o.id, "public").await.unwrap();
+    assert!(s.get_vcs_link(&again_ws.id).await.unwrap().is_none(), "no link survives its workspace");
+}
+
+pub async fn a_run_remembers_the_commit_and_pull_request_it_came_from(s: S) {
+    let (_, o) = user_and_org(&s, "a").await;
+    let (ws, cv) = ws_with_cfg(&s, &o.id, "prod").await;
+    let plain = s.create_run(&ws.id, &cv.id, Operation::PlanOnly, "", false, "t").await.unwrap();
+    assert!(plain.vcs.is_none());
+    let origin = VcsOrigin { repo: "acme/infra".into(), sha: "0123456789abcdef0123456789abcdef01234567".into(), pr: Some(42) };
+    let run = s.create_run_with(&ws.id, &cv.id, Operation::PlanOnly, "PR 42", false, "github", RunOptions { vcs: Some(origin.clone()), ..Default::default() }).await.unwrap();
+    assert_eq!(run.vcs, Some(origin.clone()));
+    assert_eq!(s.get_run(&run.id).await.unwrap().vcs, Some(origin.clone()));
+    let push = VcsOrigin { repo: "acme/infra".into(), sha: "f".repeat(40), pr: None };
+    let r2 = s.create_run_with(&ws.id, &cv.id, Operation::PlanAndApply, "push", false, "github", RunOptions { vcs: Some(push.clone()), ..Default::default() }).await.unwrap();
+    assert_eq!(s.list_runs(Some(&ws.id)).await.unwrap().iter().find(|r| r.id == r2.id).unwrap().vcs, Some(push), "a push has no pull request");
 }
 
 pub async fn logs_keep_order(s: S) {

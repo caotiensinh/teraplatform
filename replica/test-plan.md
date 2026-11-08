@@ -281,3 +281,27 @@ Total: 238 tests (was 211).
 | F12-X | 14 mutation checks, all turn a test red (one, queuing a check without a state, needed a stronger test first) | mutation | see backend.md |
 
 Total: 277 tests (was 259), run on PostgreSQL with the real tofu and Docker cases, none skipped.
+
+## F13 pull-request runs (fix P2)
+
+| id | what | how | result |
+| --- | --- | --- | --- |
+| F13-C | HMAC-SHA256 against the RFC 4231 vectors; a claimed signature is compared whole, in constant time, never panics | unit | pass |
+| F13-A | a GitHub-style archive (one top folder, optional folder) is read; nested module folders still refused | unit | pass |
+| F13-D | decisions: same-repository pull requests planned; forks, other repositories, other actions, bad hashes, other branches, deleted branches ignored | unit | pass |
+| F13-T | comment text: plan line, changes, lint, link; bounded; hostile text defanged | unit | pass |
+| F13-S | link secrets sealed, rotated, token kept or replaced, input validation, removal with the workspace; a run keeps its origin | store contract + memory | pass (both stores) |
+| F13-N01 | connect through the API: secret once, no secret on read, validation, rights, other organization | e2e n01 | pass |
+| F13-N02 | unsigned, wrongly signed, re-signed and tampered deliveries refused; ping; unknown workspace; the old secret after rotation | e2e n02 | pass |
+| F13-N03 | a pull request is planned (speculative, no lock, lint) and commented with the token | e2e n03 | pass |
+| F13-N04 | redelivery planned once; new commit and another pull request planned again | e2e n04 | pass |
+| F13-N05 | forks, other repository, closed, labelled, other branch, other event: nothing fetched or queued | e2e n05 | pass |
+| F13-N06/07 | push: only the configured folder, waits for confirmation, no comment; auto-apply applies | e2e n06, n07 | pass |
+| F13-N08 | a commit that cannot be fetched or has no `.tf` files is reported on the pull request | e2e n08 | pass |
+| F13-N09 | no token: downloaded anonymously, nothing posted, the log says why | e2e n09 | pass |
+| F13-N10 | a failed plan is reported; `@octocat` in a resource name notifies nobody | e2e n10 | pass |
+| F13-N11 | settings page: connect, secret shown once, disconnect | e2e n11 | pass |
+| F13-R | a real tarball from github.com: redirect followed, top folder as expected, 404 message | opt-in unit test | pass (once) |
+| F13-X | 17 mutation checks, all turn a test red | mutation | see backend.md |
+
+Total: 302 tests (was 277), run on PostgreSQL with the real tofu and Docker cases; the opt-in real-GitHub download test was run once separately.

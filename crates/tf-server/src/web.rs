@@ -435,7 +435,7 @@ pub struct NewRunForm {
 pub async fn create_run(State(st): State<AppState>, Extension(p): Extension<Principal>, Path(id): Path<String>, Form(f): Form<NewRunForm>) -> Result<Redirect, WebError> {
     ws_access(&st, &p, &id, Action::QueueRun).await?;
     let op = if f.mode == "plan_only" { Operation::PlanOnly } else { Operation::PlanAndApply };
-    let opts = RunOptions { skip_refresh: f.skip_refresh == "on", refresh_only: false };
+    let opts = RunOptions { skip_refresh: f.skip_refresh == "on", refresh_only: false, vcs: None };
     let run = queue_run(&st.store, &id, &f.config, f.message.trim(), op, f.auto_apply == "on", "ui", opts).await?;
     Ok(Redirect::to(&format!("/runs/{}", run.id)))
 }
@@ -968,12 +968,110 @@ async fn settings_view(st: &AppState, p: &Principal, ws: &Workspace, error: Opti
     } else {
         String::new()
     };
+    let repo_card = repo_card(st, p, ws).await?;
     let body = format!(
-        "<div class=\"page-header\"><div><div class=\"crumbs\"><a href=\"/workspaces\">Workspaces</a> / <a href=\"/workspaces/{id}\">{name}</a></div><h1>Settings</h1></div></div>{err}{form}{danger}",
+        "<div class=\"page-header\"><div><div class=\"crumbs\"><a href=\"/workspaces\">Workspaces</a> / <a href=\"/workspaces/{id}\">{name}</a></div><h1>Settings</h1></div></div>{err}{form}{repo_card}{danger}",
         id = esc(&ws.id),
         name = esc(&ws.name)
     );
     page(st, p, "Settings", "workspaces", body, false).await
+}
+
+/// The "Repository" card of the settings page: what the workspace is connected to, and the forms to change it.
+async fn repo_card(st: &AppState, p: &Principal, ws: &Workspace) -> Result<String, WebError> {
+    let link = st.store.get_vcs_link(&ws.id).await?;
+    let can = p.can(Action::UpdateWorkspace);
+    let hook = format!("{}/webhooks/github/{}", st.cfg.base_url.trim_end_matches('/'), ws.id);
+    let status = match &link {
+        Some(l) => format!(
+            "<p style=\"margin-top:0\">Connected to <span class=\"mono\">{}</span>, branch <span class=\"mono\">{}</span>{}. A pull request is planned and the result is commented on it; a push to the branch queues a run to apply.</p>\
+<p class=\"muted\">Webhook address: <span class=\"mono\">{}</span> · access token: {}</p>",
+            esc(&l.repo),
+            esc(&l.branch),
+            if l.working_dir.is_empty() { String::new() } else { format!(", folder <span class=\"mono\">{}</span>", esc(&l.working_dir)) },
+            esc(&hook),
+            if l.has_token { "set" } else { "not set (needed for private repositories and for comments)" }
+        ),
+        None => "<p class=\"muted\" style=\"margin-top:0\">Not connected. Connect a GitHub repository to plan pull requests automatically. Pull requests from forks are never planned.</p>".to_string(),
+    };
+    let forms = if can {
+        let disconnect = if link.is_some() {
+            format!("<form class=\"inline\" method=\"post\" action=\"/workspaces/{}/vcs/disconnect\"><button class=\"btn btn-secondary btn-sm\" type=\"submit\">Disconnect</button></form>", esc(&ws.id))
+        } else {
+            String::new()
+        };
+        format!(
+            "<form method=\"post\" action=\"/workspaces/{id}/vcs\" style=\"display:grid;gap:12px;margin-top:12px\">\
+<div class=\"form-row\"><div class=\"field\"><label for=\"repo\">Repository (owner/name)</label><input id=\"repo\" name=\"repo\" value=\"{repo}\" required></div>\
+<div class=\"field\"><label for=\"branch\">Branch</label><input id=\"branch\" name=\"branch\" value=\"{branch}\" required></div>\
+<div class=\"field\"><label for=\"working_dir\">Folder (optional)</label><input id=\"working_dir\" name=\"working_dir\" value=\"{dir}\"></div></div>\
+<div class=\"field\"><label for=\"token\">Access token</label><input id=\"token\" name=\"token\" type=\"password\" autocomplete=\"off\" placeholder=\"{ph}\">\
+<div class=\"hint\">A GitHub token that can read the repository's contents and write pull request comments. It is stored encrypted and never shown again.</div></div>\
+<div class=\"form-row\"><button class=\"btn btn-primary\" type=\"submit\">{verb}</button> {disconnect}</div>\
+<div class=\"hint\">Connecting makes a new webhook secret and shows it once.</div></form>",
+            id = esc(&ws.id),
+            repo = esc(link.as_ref().map(|l| l.repo.as_str()).unwrap_or("")),
+            branch = esc(link.as_ref().map(|l| l.branch.as_str()).unwrap_or("main")),
+            dir = esc(link.as_ref().map(|l| l.working_dir.as_str()).unwrap_or("")),
+            ph = if link.as_ref().map(|l| l.has_token).unwrap_or(false) { "leave empty to keep the stored token" } else { "ghp_..." },
+            verb = if link.is_some() { "Save and make a new secret" } else { "Connect" },
+        )
+    } else {
+        String::new()
+    };
+    Ok(format!("<div class=\"card\" style=\"margin-top:16px\" id=\"repository\"><div class=\"card-h\">Repository</div><div class=\"card-b\">{status}{forms}</div></div>"))
+}
+
+#[derive(Deserialize)]
+pub struct RepoForm {
+    repo: String,
+    #[serde(default)]
+    branch: String,
+    #[serde(default)]
+    working_dir: String,
+    #[serde(default)]
+    token: String,
+}
+
+pub async fn connect_repo(State(st): State<AppState>, Extension(p): Extension<Principal>, Path(id): Path<String>, Form(f): Form<RepoForm>) -> Result<Response, WebError> {
+    let ws = ws_access(&st, &p, &id, Action::UpdateWorkspace).await?;
+    let token = f.token.trim();
+    let branch = if f.branch.trim().is_empty() { "main" } else { f.branch.trim() };
+    match st.store.set_vcs_link(&id, f.repo.trim(), branch, f.working_dir.trim(), if token.is_empty() { None } else { Some(token) }).await {
+        Ok((link, secret)) => {
+            let hook = format!("{}/webhooks/github/{}", st.cfg.base_url.trim_end_matches('/'), ws.id);
+            let body = format!(
+                "<div class=\"page-header\"><div><div class=\"crumbs\"><a href=\"/workspaces\">Workspaces</a> / <a href=\"/workspaces/{id}\">{name}</a> / <a href=\"/workspaces/{id}/settings\">settings</a></div><h1>Repository connected</h1></div></div>\
+<div class=\"banner banner-warning\" role=\"status\">Copy the secret now. It is not shown again; connecting again makes a new one.</div>\
+<div class=\"card\"><div class=\"card-b\"><p style=\"margin-top:0\">In <span class=\"mono\">{repo}</span> on GitHub, open Settings, Webhooks, Add webhook:</p>\
+<ul><li>Payload URL: <span class=\"mono\">{hook}</span></li><li>Content type: <span class=\"mono\">application/json</span></li>\
+<li>Secret: <span class=\"mono\" id=\"secret\">{secret}</span></li><li>Events: <b>Pull requests</b> and <b>Pushes</b></li></ul>\
+<p class=\"muted\">Branch <span class=\"mono\">{branch}</span>{dir}. Access token: {tok}.</p><p><a href=\"/workspaces/{id}/settings\">Back to settings</a></p></div></div>",
+                id = esc(&ws.id),
+                name = esc(&ws.name),
+                repo = esc(&link.repo),
+                hook = esc(&hook),
+                secret = esc(&secret),
+                branch = esc(&link.branch),
+                dir = if link.working_dir.is_empty() { String::new() } else { format!(", folder <span class=\"mono\">{}</span>", esc(&link.working_dir)) },
+                tok = if link.has_token { "stored" } else { "not set" },
+            );
+            Ok(page(&st, &p, "Repository connected", "workspaces", body, false).await?.into_response())
+        }
+        Err(e @ StoreError::Invalid(_)) => {
+            let html = settings_view(&st, &p, &ws, Some(e.to_string())).await?;
+            Ok((StatusCode::UNPROCESSABLE_ENTITY, html).into_response())
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+pub async fn disconnect_repo(State(st): State<AppState>, Extension(p): Extension<Principal>, Path(id): Path<String>) -> Result<Redirect, WebError> {
+    ws_access(&st, &p, &id, Action::UpdateWorkspace).await?;
+    match st.store.delete_vcs_link(&id).await {
+        Ok(()) | Err(StoreError::NotFound(_)) => Ok(Redirect::to(&format!("/workspaces/{id}/settings"))),
+        Err(e) => Err(e.into()),
+    }
 }
 
 pub async fn settings(State(st): State<AppState>, Extension(p): Extension<Principal>, Path(id): Path<String>) -> Page {
@@ -1059,6 +1157,7 @@ mod tests {
             lint: vec![],
             skip_refresh: false,
             refresh_only: false,
+            vcs: None,
             status_timestamps: stamps.iter().map(|(k, v)| (k.to_string(), *v)).collect::<BTreeMap<_, _>>(),
             created_at: 0,
             updated_at: 0,

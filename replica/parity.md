@@ -6,14 +6,14 @@ their public documentation only (`recon.md`). Clone: the Rust run platform in
 
 | | |
 | --- | --- |
-| **Overall** | **55.6 / 100** (34.6 at first; 36.4 after the OpenTofu http backend; 40.1 after the real `tofu` driver and its sandbox; 43.8 after live log streaming and force-cancel; 50.6 after the JSON:API, pagination, archive upload and rate limit; 54.3 after lock leases, workspace settings and state transfer URLs; 55.6 after free drift detection (partial). The lists below the table are as of the 34.6 run; `features.csv` is current) |
-| Feature score | 55.6 (34 features counted, must 3 / should 2 / could 1, partial counts half) |
+| **Overall** | **56.8 / 100** (34.6 at first; 36.4 after the OpenTofu http backend; 40.1 after the real `tofu` driver and its sandbox; 43.8 after live log streaming and force-cancel; 50.6 after the JSON:API, pagination, archive upload and rate limit; 54.3 after lock leases, workspace settings and state transfer URLs; 55.6 after free drift detection (partial); 56.8 after GitHub pull-request runs (partial). The lists below the table are as of the 34.6 run; `features.csv` is current) |
+| Feature score | 56.8 (34 features counted, must 3 / should 2 / could 1, partial counts half) |
 | Must-haves done | 7 of 17 fully (live log, run actions, REST API, workspaces and settings, locking); 9 more are partial; 1 not started |
 | Layout score | **not measured**: see below |
 | Open bugs | none at S1 or S2 (`bugs.md`, 13 found; B13 fixed except for the Windows process mode limit) |
 | **Verdict** | **Not shippable**: 10 of 17 must-have features are not done |
 
-The score says "55.6" because that is where the clone is. The part that exists
+The score says "56.8" because that is where the clone is. The part that exists
 (accounts, tenant isolation, queue, state and secrets handling, plan/confirm/
 apply) is solid and tested; the part that makes it a replacement for the
 original (a real engine, the CLI backend protocol, VCS, policy) is not built.
@@ -35,7 +35,7 @@ do not chase the original's look.
 
 ## Feature parity (from parity.py)
 
-features 55.6  (34 counted, must-haves 7 of 17 done)
+features 56.8  (34 counted, must-haves 7 of 17 done)
 
 Not shippable yet: 10 must-have features are not done.
 

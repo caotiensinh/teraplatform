@@ -27,6 +27,7 @@ tokio-stream = "0.1"
 serde_urlencoded = "0.7"
 flate2 = "1"
 tar = "0.4"
+ureq = "2"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

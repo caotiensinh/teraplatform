@@ -20,6 +20,7 @@ struct Inner {
     email_tokens: HashMap<Vec<u8>, (Id, String, u64, bool)>, // user, purpose, expires, used
     workspaces: HashMap<Id, Workspace>,
     configs: HashMap<Id, ConfigVersion>,
+    vcs: HashMap<Id, VcsRecord>,
     variables: HashMap<Id, Vec<Variable>>, // sensitive values sealed
     runs: HashMap<Id, Run>,
     run_order: Vec<Id>,
@@ -63,6 +64,11 @@ impl MemoryStore {
         self.g().variables.get(ws).and_then(|v| v.iter().find(|x| x.key == key)).and_then(|v| v.value.clone())
     }
 
+    /// The sealed webhook secret and token as stored (tests only prove nothing is in the clear).
+    pub fn raw_vcs(&self, ws: &str) -> Option<(String, Option<String>)> {
+        self.g().vcs.get(ws).map(|r| (r.webhook_secret.clone(), r.token.clone()))
+    }
+
     pub fn raw_plan_blob(&self, run: &str) -> Option<String> {
         self.g().plan_blobs.get(run).cloned()
     }
@@ -95,6 +101,25 @@ fn transition(g: &mut Inner, run_id: &str, ev: Event) -> Result<Run> {
     Ok(out)
 }
 
+/// Shared by both stores: what a repository link may hold.
+pub(crate) fn check_vcs_input(repo: &str, branch: &str, working_dir: &str, token: Option<&str>) -> Result<()> {
+    if !valid_repo(repo) {
+        return Err(StoreError::Invalid("the repository is written owner/name".into()));
+    }
+    if !valid_branch(branch) {
+        return Err(StoreError::Invalid("the branch name has characters a branch cannot have".into()));
+    }
+    if !valid_working_dir(working_dir.trim_matches('/')) {
+        return Err(StoreError::Invalid("the working directory is a folder inside the repository, without .. or a leading slash".into()));
+    }
+    if let Some(t) = token {
+        if t.is_empty() || t.len() > 255 || t.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            return Err(StoreError::Invalid("the access token is empty, too long, or has spaces in it".into()));
+        }
+    }
+    Ok(())
+}
+
 /// Longest drift check interval: a year.
 pub const MAX_DRIFT_INTERVAL: u64 = 31_536_000;
 
@@ -111,7 +136,16 @@ fn expire_locks(g: &mut Inner) {
     }
 }
 
+/// A repository link as it rests: the secrets sealed.
+#[derive(Clone)]
+struct VcsRecord {
+    link: VcsLink,
+    webhook_secret: String,
+    token: Option<String>,
+}
+
 fn remove_workspace(g: &mut Inner, w: &str) {
+    g.vcs.remove(w);
     let run_ids: Vec<Id> = g.runs.values().filter(|r| r.workspace_id == w).map(|r| r.id.clone()).collect();
     for r in &run_ids {
         g.runs.remove(r);
@@ -571,6 +605,48 @@ impl Store for MemoryStore {
         Ok(g.configs.values().filter(|c| c.workspace_id == ws && c.status == "uploaded").max_by_key(|c| (c.created_at, c.id.clone())).cloned())
     }
 
+    // ---- repository link ----
+    async fn set_vcs_link(&self, ws: &str, repo: &str, branch: &str, working_dir: &str, token: Option<&str>) -> Result<(VcsLink, String)> {
+        check_vcs_input(repo, branch, working_dir, token)?;
+        let mut g = self.g();
+        if !g.workspaces.contains_key(ws) {
+            return Err(nf("workspace"));
+        }
+        let secret = tf_crypto::random_token("whsec_");
+        let kept = g.vcs.get(ws).and_then(|r| r.token.clone());
+        let token_sealed = match token {
+            Some(t) => Some(self.sealer.seal_vcs(ws, "token", t)),
+            None => kept,
+        };
+        let link = VcsLink { workspace_id: ws.to_string(), repo: repo.to_string(), branch: branch.to_string(), working_dir: working_dir.trim_matches('/').to_string(), has_token: token_sealed.is_some(), created_at: now() };
+        g.vcs.insert(ws.to_string(), VcsRecord { link: link.clone(), webhook_secret: self.sealer.seal_vcs(ws, "webhook", &secret), token: token_sealed });
+        Ok((link, secret))
+    }
+
+    async fn get_vcs_link(&self, ws: &str) -> Result<Option<VcsLink>> {
+        let g = self.g();
+        if !g.workspaces.contains_key(ws) {
+            return Err(nf("workspace"));
+        }
+        Ok(g.vcs.get(ws).map(|r| r.link.clone()))
+    }
+
+    async fn vcs_credentials(&self, ws: &str) -> Result<Option<VcsCredentials>> {
+        let rec = self.g().vcs.get(ws).cloned();
+        let Some(r) = rec else { return Ok(None) };
+        let webhook_secret = self.sealer.open_vcs(ws, "webhook", &r.webhook_secret)?;
+        let token = r.token.as_deref().map(|t| self.sealer.open_vcs(ws, "token", t)).transpose()?;
+        Ok(Some(VcsCredentials { link: r.link, webhook_secret, token }))
+    }
+
+    async fn delete_vcs_link(&self, ws: &str) -> Result<()> {
+        let mut g = self.g();
+        if !g.workspaces.contains_key(ws) {
+            return Err(nf("workspace"));
+        }
+        g.vcs.remove(ws).map(|_| ()).ok_or_else(|| StoreError::NotFound("this workspace is not connected to a repository".into()))
+    }
+
     // ---- variables ----
     async fn set_variable(&self, ws: &str, v: NewVariable) -> Result<Variable> {
         if !valid_variable_key(&v.key) {
@@ -682,6 +758,7 @@ impl Store for MemoryStore {
             lint: Vec::new(),
             skip_refresh: opts.skip_refresh,
             refresh_only: opts.refresh_only,
+            vcs: opts.vcs.clone(),
             created_at: t,
             updated_at: t,
         };
@@ -916,6 +993,19 @@ mod tests {
     }
 
     crate::all_contract_tests!(make);
+
+    #[tokio::test]
+    async fn the_webhook_secret_and_token_rest_sealed() {
+        let s = MemoryStore::new();
+        let u = s.create_user("a@example.com", "h", "a").await.unwrap();
+        let o = s.create_org("org", &u.id).await.unwrap();
+        let ws = s.create_workspace(&o.id, "prod").await.unwrap();
+        let (_, secret) = s.set_vcs_link(&ws.id, "acme/infra", "main", "", Some("ghp_plaintext_token")).await.unwrap();
+        let (sealed_secret, sealed_token) = s.raw_vcs(&ws.id).unwrap();
+        for raw in [sealed_secret, sealed_token.unwrap()] {
+            assert!(raw.starts_with("enc:v1:") && !raw.contains("ghp_plaintext_token") && !raw.contains(&secret), "{raw}");
+        }
+    }
 
     #[tokio::test]
     async fn nothing_sensitive_rests_in_plaintext() {

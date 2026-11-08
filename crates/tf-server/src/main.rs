@@ -98,6 +98,7 @@ async fn main() {
         cli_lock_lease_secs: env("TF_CLI_LOCK_LEASE_SECS").and_then(|v| v.parse().ok()).unwrap_or(12 * 3600),
         min_drift_interval_secs: env("TF_MIN_DRIFT_INTERVAL_SECS").and_then(|v| v.parse().ok()).unwrap_or(300),
         drift_tick_secs: env("TF_DRIFT_TICK_SECS").and_then(|v| v.parse().ok()).unwrap_or(60),
+        github_api: env("TF_GITHUB_API").unwrap_or_else(|| "https://api.github.com".into()),
     };
     if !cfg.cookie_secure {
         eprintln!("warning: TF_COOKIE_SECURE is off; set it to 1 when serving over HTTPS");
@@ -110,7 +111,7 @@ async fn main() {
         Err(e) => die(&format!("could not recover interrupted runs: {e}")),
     }
     let state = tf_server::AppState::new(store.clone(), engine.name(), Arc::new(LogMailer), cfg);
-    tf_server::runner::spawn(store, engine.clone(), state.cancels.clone());
+    tf_server::runner::spawn_with(store, engine.clone(), state.cancels.clone(), Some(state.reporter()));
     tf_server::drift::spawn(&state);
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap_or_else(|e| die(&format!("cannot listen on {addr}: {e}")));
     eprintln!("tf-server listening on http://{addr} (engine: {})", engine.name());

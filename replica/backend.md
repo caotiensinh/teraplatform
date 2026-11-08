@@ -332,3 +332,37 @@ A run can plan without refreshing the state first (`-refresh=false`): the API ta
 - Outputs that change after a refresh count as changes in the summary, as in a plan.
 
 Tests: engine unit tests (simulator refresh-only and skip, `resource_drift` parsing), a real-`tofu` test, store contract tests (options kept, due checks, interval validation, latest configuration), e2e `m01` to `m08`. 14 mutation checks, all turn a test red (one, queuing a check without a state, needed a stronger test first).
+
+## Pull-request runs through a GitHub webhook (added 2026-11-08, fix P2 from `fixes.md`)
+
+### What happens
+
+1. An owner connects a workspace to a repository: settings page, or `PUT /api/v2/workspaces/{id}/vcs` (`repo` as `owner/name`, `branch` default `main`, `working-directory`, `token`). The answer shows the **webhook secret once**; the webhook address is `<base url>/webhooks/github/<workspace id>`. Connecting again makes a new secret (the old one stops working) and keeps the stored token unless a new one is given. `GET` never shows a secret; `DELETE` disconnects. Rights: owners and admins connect, anyone with read access can look. Migration `0008`.
+2. In GitHub the owner adds a webhook with that address, content type JSON, that secret, events *Pull requests* and *Pushes*.
+3. **Every delivery is checked first:** the `X-Hub-Signature-256` header must be the HMAC-SHA256 of the exact body under the secret (constant-time comparison; `hmac` crate, RFC 4231 vectors in the tests). Missing, malformed or wrong: 401 and nothing is read. A workspace that is not connected, or does not exist, is 404.
+4. Then, by event:
+   - `ping`: 200.
+   - `pull_request` opened, reopened or synchronize, from the **same repository**: the commit is downloaded (`GET /repos/{repo}/tarball/{sha}`, with the token when there is one), the folder is read as in an archive upload (top folder stripped, optional working folder), a configuration version is created, and a **speculative plan** is queued (no lock, never applied). When it finishes, the result is commented on the pull request: the plan line, the resource changes, the lint findings, a link to the run. The run records `vcs` (repo, commit, pull request) and its log says `Fetched ...` and `Posted the result on pull request #N`.
+   - `push` to the tracked branch: a run that plans for applying is queued (it waits for confirmation unless the workspace auto-applies). No comment, since there is no pull request.
+   - anything else, another repository, a closed or labelled pull request, a push to another branch, a deleted branch: answered 202 `ignored` with the reason.
+   - The same commit of the same pull request is planned once (GitHub redelivers); a new commit, or the same commit in another pull request, is planned again.
+5. The webhook answers `202` at once and does the download in the background (GitHub gives a delivery ten seconds). If the commit cannot be fetched or read (404, a token GitHub refuses, no `.tf` files, an archive that is too large) no run exists to carry the message, so a comment on the pull request says why, when there is a token.
+
+### Safety decisions
+
+- **Pull requests from forks are never planned.** Their code would run with this workspace's secrets and variables. There is no setting to allow them.
+- A repository name, a branch and a commit hash are validated before they are used in a URL (a commit is exactly 40 hex digits). The GitHub address is the operator's setting (`TF_GITHUB_API`), never a user's input.
+- The access token and webhook secret rest sealed (and the database refuses a value that is not), are never returned, and do not appear in comments, logs or errors.
+- Text from the repository (resource names, lint messages) is put into the comment inside code spans with backticks removed, `@` broken with a zero-width space (so nobody is notified), control characters dropped and length bounded.
+- The download is capped at 25 MB; the unpacked configuration at the usual 1 MB.
+
+### Known limits
+
+- **Not tried against github.com itself, except the download.** The download (redirect, tarball layout, a 404 message) was run once against a real public repository (`TF_TEST_GITHUB_REAL=1`). The signature check uses the algorithm GitHub documents and RFC test vectors. Posting a comment, and a real signed delivery from GitHub, are covered only by a local stand-in server in the tests. The first real pull request is the next thing to verify.
+- No GitHub App: a personal access token is used (it belongs to a person, and may be revoked with them). Webhook secrets are per workspace.
+- It does **not** hold the workspace lock until the pull request is merged (what Atlantis does); a plan is just a plan. Each push to a pull request adds a **new** comment instead of updating one.
+- GitHub only; no GitLab, Bitbucket or other hosts, no GitHub Enterprise path other than setting `TF_GITHUB_API`.
+- Only `.tf` files at the top of the (folder of the) repository: no local modules in subdirectories and no `.tf.json`, as for uploads.
+- The commit is fetched on every delivery of a new commit; there is no queue or limit on how many a busy repository can start at once.
+
+Tests: HMAC vectors, archive layout (unit); decisions, comment text and sanitising (unit, `github.rs`); store contract tests for the link (secrets kept, rotated, refused input, deletion with the workspace) and for a run's origin; e2e `n01` to `n11` (connection, signature checks, a pull request planned and commented, redelivery, forks and other events ignored, push, auto-apply, failures reported, no token, a failed plan and hostile text, the settings page); one real download from github.com. 17 mutation checks, all turn a test red.

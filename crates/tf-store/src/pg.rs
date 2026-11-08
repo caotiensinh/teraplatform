@@ -60,7 +60,7 @@ fn user_cols() -> String {
 fn run_cols() -> String {
     format!(
         "id, workspace_id, config_version_id, status, operation, source, message, auto_apply, summary, changes, \
-         input_state_serial, status_timestamps, lint, skip_refresh, refresh_only, {EPOCH} created_at)::bigint as created_at, \
+         input_state_serial, status_timestamps, lint, skip_refresh, refresh_only, vcs, {EPOCH} created_at)::bigint as created_at, \
          {EPOCH} updated_at)::bigint as updated_at"
     )
 }
@@ -118,6 +118,7 @@ fn run_from(r: &PgRow) -> Result<Run> {
     let changes: Json<Vec<ResourceChange>> = r.get("changes");
     let stamps: Json<std::collections::BTreeMap<String, u64>> = r.get("status_timestamps");
     let lint: Json<Vec<LintFinding>> = r.get("lint");
+    let vcs: Option<Json<VcsOrigin>> = r.get("vcs");
     Ok(Run {
         id: r.get("id"),
         workspace_id: r.get("workspace_id"),
@@ -134,6 +135,7 @@ fn run_from(r: &PgRow) -> Result<Run> {
         lint: lint.0,
         skip_refresh: r.get("skip_refresh"),
         refresh_only: r.get("refresh_only"),
+        vcs: vcs.map(|j| j.0),
         created_at: r.get::<i64, _>("created_at") as u64,
         updated_at: r.get::<i64, _>("updated_at") as u64,
     })
@@ -893,8 +895,8 @@ impl Store for PgStore {
             return Err(if exists.is_none() { nf("workspace") } else { StoreError::NotFound("configuration version not found in this workspace".into()) });
         }
         let r = sqlx::query(&format!(
-            "insert into runs (workspace_id, config_version_id, status, operation, source, message, auto_apply, skip_refresh, refresh_only, status_timestamps) \
-             values ($1,$2,'pending',$3,$4,$5,$6,$7,$8, jsonb_build_object('pending', extract(epoch from now())::bigint)) returning {}",
+            "insert into runs (workspace_id, config_version_id, status, operation, source, message, auto_apply, skip_refresh, refresh_only, vcs, status_timestamps) \
+             values ($1,$2,'pending',$3,$4,$5,$6,$7,$8,$9, jsonb_build_object('pending', extract(epoch from now())::bigint)) returning {}",
             run_cols()
         ))
         .bind(ws)
@@ -905,6 +907,7 @@ impl Store for PgStore {
         .bind(auto_apply)
         .bind(opts.skip_refresh)
         .bind(opts.refresh_only)
+        .bind(opts.vcs.as_ref().map(Json))
         .fetch_one(&mut *tx)
         .await
         .map_err(db)?;
@@ -967,6 +970,88 @@ impl Store for PgStore {
         .map_err(db)?
         .ok_or_else(|| nf("run"))?;
         run_from(&r)
+    }
+
+    async fn set_vcs_link(&self, ws: &str, repo: &str, branch: &str, working_dir: &str, token: Option<&str>) -> Result<(VcsLink, String)> {
+        crate::memory::check_vcs_input(repo, branch, working_dir, token)?;
+        let secret = tf_crypto::random_token("whsec_");
+        let sealed_secret = self.sealer.seal_vcs(ws, "webhook", &secret);
+        let sealed_token = token.map(|t| self.sealer.seal_vcs(ws, "token", t));
+        let dir = working_dir.trim_matches('/').to_string();
+        let r = sqlx::query(
+            "insert into vcs_links (workspace_id, repo, branch, working_dir, webhook_secret, token) values ($1,$2,$3,$4,$5,$6) \
+             on conflict (workspace_id) do update set repo = $2, branch = $3, working_dir = $4, webhook_secret = $5, \
+               token = coalesce($6, vcs_links.token), created_at = now() \
+             returning token is not null as has_token, extract(epoch from created_at)::bigint as created_at",
+        )
+        .bind(ws)
+        .bind(repo)
+        .bind(branch)
+        .bind(&dir)
+        .bind(sealed_secret)
+        .bind(sealed_token)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| match db(e) {
+            StoreError::NotFound(_) => nf("workspace"),
+            other => other,
+        })?;
+        let link = VcsLink {
+            workspace_id: ws.to_string(),
+            repo: repo.to_string(),
+            branch: branch.to_string(),
+            working_dir: dir,
+            has_token: r.get("has_token"),
+            created_at: r.get::<i64, _>("created_at") as u64,
+        };
+        Ok((link, secret))
+    }
+
+    async fn get_vcs_link(&self, ws: &str) -> Result<Option<VcsLink>> {
+        self.get_workspace(ws).await?;
+        let r = sqlx::query("select repo, branch, working_dir, token is not null as has_token, extract(epoch from created_at)::bigint as created_at from vcs_links where workspace_id = $1")
+            .bind(ws)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db)?;
+        Ok(r.map(|r| VcsLink {
+            workspace_id: ws.to_string(),
+            repo: r.get("repo"),
+            branch: r.get("branch"),
+            working_dir: r.get("working_dir"),
+            has_token: r.get("has_token"),
+            created_at: r.get::<i64, _>("created_at") as u64,
+        }))
+    }
+
+    async fn vcs_credentials(&self, ws: &str) -> Result<Option<VcsCredentials>> {
+        let r = sqlx::query("select repo, branch, working_dir, webhook_secret, token, extract(epoch from created_at)::bigint as created_at from vcs_links where workspace_id = $1")
+            .bind(ws)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db)?;
+        let Some(r) = r else { return Ok(None) };
+        let token_sealed: Option<String> = r.get("token");
+        let link = VcsLink {
+            workspace_id: ws.to_string(),
+            repo: r.get("repo"),
+            branch: r.get("branch"),
+            working_dir: r.get("working_dir"),
+            has_token: token_sealed.is_some(),
+            created_at: r.get::<i64, _>("created_at") as u64,
+        };
+        let webhook_secret = self.sealer.open_vcs(ws, "webhook", &r.get::<String, _>("webhook_secret"))?;
+        let token = token_sealed.as_deref().map(|t| self.sealer.open_vcs(ws, "token", t)).transpose()?;
+        Ok(Some(VcsCredentials { link, webhook_secret, token }))
+    }
+
+    async fn delete_vcs_link(&self, ws: &str) -> Result<()> {
+        self.get_workspace(ws).await?;
+        let done = sqlx::query("delete from vcs_links where workspace_id = $1").bind(ws).execute(&self.pool).await.map_err(db)?;
+        if done.rows_affected() == 0 {
+            return Err(StoreError::NotFound("this workspace is not connected to a repository".into()));
+        }
+        Ok(())
     }
 
     async fn record_drift(&self, ws: &str, status: DriftStatus) -> Result<()> {

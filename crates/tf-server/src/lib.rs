@@ -7,6 +7,7 @@ pub mod auth;
 pub mod authz;
 pub mod backend;
 pub mod drift;
+pub mod github;
 pub mod grants;
 pub mod jsonapi;
 pub mod runner;
@@ -44,6 +45,11 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// What the runner needs to report finished pull-request plans.
+    pub fn reporter(&self) -> github::Reporter {
+        github::Reporter { base_url: self.cfg.base_url.clone(), github_api: self.cfg.github_api.clone() }
+    }
+
     pub fn new(store: Arc<dyn Store>, engine_name: &'static str, mailer: Arc<dyn auth::Mailer>, cfg: auth::Config) -> Self {
         Self { store, engine_name, mailer, limiter: Arc::new(auth::RateLimiter::default()), cfg: Arc::new(cfg), cancels: runner::Cancels::new(), grants: Arc::new(grants::Grants::default()) }
     }
@@ -128,6 +134,8 @@ pub fn app(state: AppState) -> Router {
         .route("/forgot", get(auth::forgot_page).post(auth::forgot))
         .route("/reset", get(auth::reset_page).post(auth::reset))
         .route("/logout", post(auth::logout))
+        // a repository tells the platform about pull requests and pushes; the signature is the credential
+        .route("/webhooks/github/{workspace}", post(github::webhook).layer(DefaultBodyLimit::max(2_000_000)))
         // single-use state transfer: the unguessable URL is the credential
         .route("/archivist/v1/object/{token}", get(grants::download).put(grants::upload).layer(DefaultBodyLimit::max(grants::MAX_STATE_BYTES)));
 
@@ -162,6 +170,9 @@ pub fn app(state: AppState) -> Router {
         .route("/api/v2/workspaces/{id}/runs", get(api::list_runs_in_workspace).post(api::create_run))
         .route("/api/v2/workspaces/{id}/configuration-versions", post(api::create_config_version))
         .route("/api/v2/workspaces/{id}/state-versions", get(api::list_states).post(api::create_state_upload))
+        .route("/api/v2/workspaces/{id}/vcs", get(api::get_vcs).put(api::put_vcs).delete(api::delete_vcs))
+        .route("/workspaces/{id}/vcs", post(web::connect_repo))
+        .route("/workspaces/{id}/vcs/disconnect", post(web::disconnect_repo))
         .route("/api/v2/state-versions/{id}", get(api::get_state_version))
         .route("/api/v2/configuration-versions/{id}", get(api::get_config_version))
         .route("/api/v2/configuration-versions/{id}/upload", put(api::upload_config_version).layer(DefaultBodyLimit::max(api::MAX_UPLOAD_BYTES)))
