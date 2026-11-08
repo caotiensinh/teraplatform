@@ -176,14 +176,14 @@ pub async fn a_pending_config_runs_only_after_its_upload(s: S) {
 pub async fn a_lock_with_a_lease_lapses_and_frees_the_workspace(s: S) {
     let (_, o) = user_and_org(&s, "a").await;
     let (ws, cv) = ws_with_cfg(&s, &o.id, "prod").await;
-    let locked = s.lock_workspace(&ws.id, "cli:abc", "apply by ana", None, Some(1)).await.unwrap();
+    let locked = s.lock_workspace(&ws.id, "cli:abc", "apply by ana", None, Some(2)).await.unwrap();
     let until = locked.lock.as_ref().unwrap().expires_at.expect("a lease sets an expiry");
     assert!(until >= locked.lock.as_ref().unwrap().since);
     let run = s.create_run(&ws.id, &cv.id, Operation::PlanAndApply, "", false, "t").await.unwrap();
     assert!(s.claim_next().await.unwrap().is_none(), "while the lease runs the lock holds the run back");
     assert!(s.get_workspace(&ws.id).await.unwrap().lock.is_some());
 
-    tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(3200)).await;
     // claim first: nothing has read the workspace since the lease ran out, so claiming must notice by itself
     match s.claim_next().await.unwrap() {
         Some(Claim::Plan(r)) => assert_eq!(r.id, run.id, "the queued run starts once the lock lapsed"),
@@ -191,8 +191,8 @@ pub async fn a_lock_with_a_lease_lapses_and_frees_the_workspace(s: S) {
     }
     // reads see a lapsed lock as no lock
     let other = s.create_workspace(&o.id, "other").await.unwrap();
-    s.lock_workspace(&other.id, "cli:z", "x", None, Some(1)).await.unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
+    s.lock_workspace(&other.id, "cli:z", "x", None, Some(2)).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(3200)).await;
     assert!(s.list_workspaces(&o.id).await.unwrap().iter().find(|w| w.id == other.id).unwrap().lock.is_none(), "listing");
     assert!(s.get_workspace(&other.id).await.unwrap().lock.is_none(), "a lapsed lock is no lock");
     // the run's own lock never lapses
@@ -203,9 +203,9 @@ pub async fn a_lock_with_a_lease_lapses_and_frees_the_workspace(s: S) {
 pub async fn a_lapsed_lock_can_be_taken_over_and_a_live_one_cannot(s: S) {
     let (_, o) = user_and_org(&s, "a").await;
     let ws = s.create_workspace(&o.id, "prod").await.unwrap();
-    s.lock_workspace(&ws.id, "cli:one", "x", None, Some(1)).await.unwrap();
+    s.lock_workspace(&ws.id, "cli:one", "x", None, Some(2)).await.unwrap();
     assert!(matches!(s.lock_workspace(&ws.id, "cli:two", "y", None, Some(60)).await, Err(StoreError::Conflict(_))), "a live lock is not taken over");
-    tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(3200)).await;
     let l = s.lock_workspace(&ws.id, "cli:two", "y", None, Some(60)).await.unwrap().lock.unwrap();
     assert_eq!(l.owner, "cli:two");
     // the old holder's unlock no longer works, the new holder's does
@@ -304,6 +304,103 @@ pub async fn a_single_state_version_can_be_fetched(s: S) {
     assert_eq!((got.serial, got.content.as_str()), (1, "{\"a\":1}"), "decrypted, as stored");
     assert_eq!(s.get_state_version(&v2.id).await.unwrap().serial, 2);
     assert!(matches!(s.get_state_version("missing").await, Err(StoreError::NotFound(_))));
+}
+
+pub async fn lint_findings_are_kept_with_the_run(s: S) {
+    let (_, o) = user_and_org(&s, "a").await;
+    let (ws, cv) = ws_with_cfg(&s, &o.id, "prod").await;
+    let run = s.create_run(&ws.id, &cv.id, Operation::PlanAndApply, "", false, "t").await.unwrap();
+    assert!(run.lint.is_empty() && s.get_run(&run.id).await.unwrap().lint.is_empty(), "a new run has no findings");
+    let f = |rule: &str, line: Option<u32>| LintFinding { rule: rule.into(), severity: "warning".into(), message: format!("{rule} here"), file: Some("main.tf".into()), line };
+    s.set_lint(&run.id, vec![f("unused-variable", Some(3)), f("hardcoded-secret", None)]).await.unwrap();
+    let got = s.get_run(&run.id).await.unwrap().lint;
+    assert_eq!(got, vec![f("unused-variable", Some(3)), f("hardcoded-secret", None)], "kept in order, with file and line");
+    assert_eq!(s.list_runs(Some(&ws.id)).await.unwrap()[0].lint.len(), 2, "lists carry them too");
+    s.set_lint(&run.id, vec![]).await.unwrap();
+    assert!(s.get_run(&run.id).await.unwrap().lint.is_empty(), "replaced, not appended");
+    assert!(matches!(s.set_lint("missing", vec![]).await, Err(StoreError::NotFound(_))));
+    // findings survive the run's moves through its states
+    s.set_lint(&run.id, vec![f("unused-variable", Some(1))]).await.unwrap();
+    s.apply_event(&run.id, Event::Discard).await.unwrap();
+    assert_eq!(s.get_run(&run.id).await.unwrap().lint.len(), 1);
+}
+
+pub async fn run_options_are_kept_and_a_drift_check_must_be_speculative(s: S) {
+    let (_, o) = user_and_org(&s, "a").await;
+    let (ws, cv) = ws_with_cfg(&s, &o.id, "prod").await;
+    let plain = s.create_run(&ws.id, &cv.id, Operation::PlanAndApply, "", false, "t").await.unwrap();
+    assert!(!plain.skip_refresh && !plain.refresh_only, "plain runs refresh as usual");
+    let skip = s.create_run_with(&ws.id, &cv.id, Operation::PlanAndApply, "", false, "t", RunOptions { skip_refresh: true, refresh_only: false }).await.unwrap();
+    assert!(skip.skip_refresh && !skip.refresh_only);
+    assert!(s.get_run(&skip.id).await.unwrap().skip_refresh, "kept");
+    let drift = s.create_run_with(&ws.id, &cv.id, Operation::PlanOnly, "drift", false, "schedule", RunOptions { skip_refresh: false, refresh_only: true }).await.unwrap();
+    assert!(drift.refresh_only && !drift.skip_refresh);
+    assert!(s.list_runs(Some(&ws.id)).await.unwrap().iter().any(|r| r.id == drift.id && r.refresh_only), "lists carry it");
+    for (what, op, opts) in [
+        ("a refresh-only run that applies", Operation::PlanAndApply, RunOptions { skip_refresh: false, refresh_only: true }),
+        ("a refresh-only run that skips the refresh", Operation::PlanOnly, RunOptions { skip_refresh: true, refresh_only: true }),
+    ] {
+        assert!(matches!(s.create_run_with(&ws.id, &cv.id, op, "", false, "t", opts).await, Err(StoreError::Invalid(_))), "{what}");
+    }
+}
+
+pub async fn drift_checks_fall_due_by_their_interval(s: S) {
+    let (_, o) = user_and_org(&s, "a").await;
+    let (ws, cv) = ws_with_cfg(&s, &o.id, "prod").await;
+    let run = s.create_run(&ws.id, &cv.id, Operation::PlanAndApply, "", false, "t").await.unwrap();
+    let due = |s: &S| {
+        let s = s.clone();
+        let id = ws.id.clone();
+        async move { s.due_drift_checks().await.unwrap().iter().any(|w| w.id == id) }
+    };
+    assert!(!due(&s).await, "no interval, nothing is due");
+    assert!(s.get_workspace(&ws.id).await.unwrap().drift_interval.is_none() && s.get_workspace(&ws.id).await.unwrap().drift.is_none());
+
+    let on = s.update_workspace(&ws.id, WorkspacePatch { drift_interval: Some(Some(2)), ..Default::default() }).await.unwrap();
+    assert_eq!(on.drift_interval, Some(2));
+    assert!(!due(&s).await, "an interval but no state yet: there is nothing to refresh");
+    s.finalize_state(&ws.id, &run.id, "{}", 0).await.unwrap();
+    assert!(due(&s).await, "state and an interval, never checked: due now");
+
+    // a drift check that is waiting or working holds the next one back
+    let check = s.create_run_with(&ws.id, &cv.id, Operation::PlanOnly, "", false, "schedule", RunOptions { skip_refresh: false, refresh_only: true }).await.unwrap();
+    assert!(!due(&s).await, "one is already queued");
+    s.apply_event(&check.id, Event::Cancel).await.unwrap();
+    assert!(due(&s).await, "a canceled check does not count");
+
+    // recording a result starts the interval over
+    let status = DriftStatus { checked_at: tf_core::now(), run_id: Some(check.id.clone()), status: "drifted".into(), changes: 3 };
+    s.record_drift(&ws.id, status.clone()).await.unwrap();
+    assert_eq!(s.get_workspace(&ws.id).await.unwrap().drift, Some(status));
+    assert!(!due(&s).await, "just checked");
+    tokio::time::sleep(std::time::Duration::from_millis(3200)).await;
+    assert!(due(&s).await, "the interval has passed");
+
+    // turning the schedule off, and refusing nonsense
+    s.update_workspace(&ws.id, WorkspacePatch { drift_interval: Some(None), ..Default::default() }).await.unwrap();
+    assert!(!due(&s).await && s.get_workspace(&ws.id).await.unwrap().drift_interval.is_none());
+    assert!(s.get_workspace(&ws.id).await.unwrap().drift.is_some(), "the last result stays");
+    for bad in [0u64, 31_536_001] {
+        assert!(matches!(s.update_workspace(&ws.id, WorkspacePatch { drift_interval: Some(Some(bad)), ..Default::default() }).await, Err(StoreError::Invalid(_))), "{bad}");
+    }
+    // a patch that leaves the interval out leaves it alone
+    s.update_workspace(&ws.id, WorkspacePatch { drift_interval: Some(Some(60)), ..Default::default() }).await.unwrap();
+    s.update_workspace(&ws.id, WorkspacePatch { description: Some("x".into()), ..Default::default() }).await.unwrap();
+    assert_eq!(s.get_workspace(&ws.id).await.unwrap().drift_interval, Some(60));
+    assert!(matches!(s.record_drift("missing", DriftStatus { checked_at: 1, run_id: None, status: "clean".into(), changes: 0 }).await, Err(StoreError::NotFound(_))));
+}
+
+pub async fn the_latest_configuration_is_one_that_has_its_content(s: S) {
+    let (_, o) = user_and_org(&s, "a").await;
+    let ws = s.create_workspace(&o.id, "prod").await.unwrap();
+    assert!(s.latest_config(&ws.id).await.unwrap().is_none());
+    let done = s.create_config_version(&ws.id, "real content", "t").await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let waiting = s.create_pending_config(&ws.id, "api-upload").await.unwrap();
+    assert_ne!(done.id, waiting.id);
+    assert_eq!(s.latest_config(&ws.id).await.unwrap().unwrap().id, done.id, "a version still waiting for its archive is not the latest configuration");
+    s.upload_config(&waiting.id, "newer").await.unwrap();
+    assert_eq!(s.latest_config(&ws.id).await.unwrap().unwrap().id, waiting.id);
 }
 
 pub async fn logs_keep_order(s: S) {

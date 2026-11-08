@@ -175,6 +175,35 @@ async fn note(store: &Arc<dyn Store>, run: &str, secrets: &[String], line: &str)
     let _ = store.append_log(run, &scrub(line, secrets)).await;
 }
 
+/// Runs the lint rules on the configuration, records the findings with the run and puts a short
+/// account in its log. It never changes what happens next: a failing or panicking linter is
+/// reported as skipped and the plan goes on.
+async fn lint_step(store: &Arc<dyn Store>, run: &Run, config: &str, secrets: &[String]) {
+    let text = config.to_string();
+    let findings = match tokio::task::spawn_blocking(move || tf_lint::lint(&text)).await {
+        Ok(f) => f,
+        Err(_) => {
+            note(store, &run.id, secrets, "Lint skipped: the linter failed on this configuration. Planning goes on.").await;
+            return;
+        }
+    };
+    if findings.is_empty() {
+        note(store, &run.id, secrets, "Lint: no findings.").await;
+    } else {
+        let count = |sev: &str| findings.iter().filter(|f| f.severity == sev).count();
+        note(store, &run.id, secrets, &format!("Lint: {} finding(s): {} warning(s), {} info.", findings.len(), count("warning") + count("error"), count("info"))).await;
+        for f in &findings {
+            let at = match (&f.file, f.line) {
+                (Some(file), Some(l)) => format!(" ({file}:{l})"),
+                (None, Some(l)) => format!(" (line {l})"),
+                _ => String::new(),
+            };
+            note(store, &run.id, secrets, &format!("  lint {} {}{at}: {}", f.severity, f.rule, f.message)).await;
+        }
+    }
+    let _ = store.set_lint(&run.id, findings).await;
+}
+
 async fn plan(store: Arc<dyn Store>, engine: Arc<dyn Engine>, cancels: Cancels, run: Run) {
     // Register first, then look at the status: a cancel either sees the registration or has
     // already changed the status, so no cancel is lost.
@@ -193,6 +222,9 @@ async fn plan(store: Arc<dyn Store>, engine: Arc<dyn Engine>, cancels: Cancels, 
     };
     let mut inp = inp;
     inp.vars.cancel = Some(token);
+    inp.vars.skip_refresh = run.skip_refresh;
+    inp.vars.refresh_only = run.refresh_only;
+    lint_step(&store, &run, &inp.config, &inp.secrets).await;
     let (log, task) = sink(&store, &run.id, inp.secrets.clone());
     let result = engine.plan(&inp.config, inp.state.as_deref(), &inp.vars, &log).await;
     drop(log);
@@ -200,6 +232,9 @@ async fn plan(store: Arc<dyn Store>, engine: Arc<dyn Engine>, cancels: Cancels, 
     match result {
         Ok(out) => {
             let has_changes = out.summary.has_changes();
+            if run.refresh_only {
+                crate::drift::record(&store, &run, Some(&out.summary)).await;
+            }
             let _ = store.set_plan(&run.id, out.summary, out.changes, out.blob).await;
             let ev = Event::PlanOk { has_changes, auto_apply: run.auto_apply, plan_only: run.operation == Operation::PlanOnly };
             // Err means the run was canceled meanwhile: nothing more to do.
@@ -209,6 +244,9 @@ async fn plan(store: Arc<dyn Store>, engine: Arc<dyn Engine>, cancels: Cancels, 
         Err(EngineError::Canceled { .. }) => note(&store, &run.id, &inp.secrets, "The run was canceled and its planning step was stopped.").await,
         Err(e) => {
             note(&store, &run.id, &inp.secrets, &format!("Error: {e}")).await;
+            if run.refresh_only {
+                crate::drift::record(&store, &run, None).await;
+            }
             let _ = store.apply_event(&run.id, Event::PlanFail).await;
         }
     }

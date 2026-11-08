@@ -11,6 +11,10 @@
 //! with testing: a line `fail_plan` or `fail_apply` anywhere in the config, and
 //! `echo_var NAME` to print a variable (so log scrubbing can be proven).
 //! Input variables are substituted for `var.NAME` inside resource bodies.
+//!
+//! Drift has no real infrastructure behind it here, so it is simulated by a convention: a state
+//! entry whose recorded hash starts with `drift:` counts as changed outside the platform, and a
+//! refresh-only plan reports it.
 
 use crate::{emit, resource_count, wait_canceled, ApplyOutput, Engine, EngineError, EngineVars, Log, PlanOutput};
 use async_trait::async_trait;
@@ -111,6 +115,9 @@ impl Engine for FakeEngine {
     async fn plan(&self, config: &str, state: Option<&str>, vars: &EngineVars, log: &Log) -> Result<PlanOutput, EngineError> {
         emit(log, "Initializing the engine (simulated)...");
         self.pause(vars).await?;
+        if vars.refresh_only && vars.skip_refresh {
+            return Err(EngineError::Config("a refresh-only run cannot skip the refresh".into()));
+        }
         let desired = parse_config(config, vars)?;
         for l in config.lines() {
             if let Some(name) = l.trim().strip_prefix("echo_var ") {
@@ -123,8 +130,21 @@ impl Engine for FakeEngine {
             return Err(EngineError::Failed("plan failed on request".into()));
         }
         let current = parse_state(state);
-        emit(log, format!("Refreshing state... [{} resources]", current.len()));
+        if vars.skip_refresh {
+            emit(log, "Skipping the refresh (-refresh=false): the plan trusts the recorded state.");
+        } else {
+            emit(log, format!("Refreshing state... [{} resources]", current.len()));
+        }
         self.pause(vars).await?;
+        if vars.refresh_only {
+            let changes: Vec<ResourceChange> = current.iter().filter(|(_, h)| h.starts_with("drift:")).map(|(a, _)| ResourceChange { addr: a.clone(), action: ChangeAction::Update }).collect();
+            for c in &changes {
+                emit(log, format!("~ {} has changed outside the platform", c.addr));
+            }
+            let summary = PlanSummary { change: changes.len() as u32, ..PlanSummary::default() };
+            emit(log, if changes.is_empty() { "No drift. The recorded state matches the infrastructure.".to_string() } else { format!("Drift: {} resource(s) changed outside the platform.", changes.len()) });
+            return Ok(PlanOutput { summary, changes, blob: state_json(&current).into_bytes() });
+        }
 
         let mut changes = Vec::new();
         for (addr, h) in &desired {
@@ -243,6 +263,37 @@ mod tests {
     }
 
     const A: &str = "resource \"aws_s3_bucket\" \"logs\" {\n  bucket = \"x\"\n}\n";
+
+    #[tokio::test]
+    async fn a_refresh_only_plan_reports_drifted_entries_and_nothing_else() {
+        let e = FakeEngine::new(Duration::ZERO);
+        let (log, lines) = sink();
+        let vars = EngineVars { refresh_only: true, ..none() };
+        let clean = e.plan(A, None, &vars, &log).await.unwrap();
+        assert!(!clean.summary.has_changes(), "no state, no drift");
+        let state = r#"{"version":1,"resources":{"aws_s3_bucket.logs":"drift:abc","aws_iam_role.ci":"fine"}}"#;
+        // the configuration says something else entirely: a drift check does not diff the configuration
+        let out = e.plan("resource \"aws_x\" \"y\" {
+}
+", Some(state), &vars, &log).await.unwrap();
+        assert_eq!(out.summary, PlanSummary { add: 0, change: 1, destroy: 0, outputs: 0 });
+        assert_eq!(out.changes.iter().map(|c| c.addr.as_str()).collect::<Vec<_>>(), vec!["aws_s3_bucket.logs"]);
+        assert!(lines.lock().unwrap().iter().any(|l| l.starts_with("Drift: 1 resource(s)")));
+        // the same state in a normal plan is not drift
+        let normal = e.plan(A, Some(state), &none(), &log).await.unwrap();
+        assert!(normal.changes.iter().all(|c| c.addr != "aws_iam_role.ci" || c.action == ChangeAction::Delete));
+    }
+
+    #[tokio::test]
+    async fn skipping_the_refresh_is_said_in_the_log_and_refresh_only_cannot_skip() {
+        let e = FakeEngine::new(Duration::ZERO);
+        let (log, lines) = sink();
+        e.plan(A, None, &EngineVars { skip_refresh: true, ..none() }, &log).await.unwrap();
+        assert!(lines.lock().unwrap().iter().any(|l| l.contains("Skipping the refresh")));
+        assert!(!lines.lock().unwrap().iter().any(|l| l.starts_with("Refreshing state")));
+        let both = e.plan(A, None, &EngineVars { skip_refresh: true, refresh_only: true, ..none() }, &log).await;
+        assert!(matches!(both, Err(EngineError::Config(_))));
+    }
 
     #[tokio::test]
     async fn first_plan_creates_everything() {

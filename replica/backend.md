@@ -297,3 +297,38 @@ At most `TF_API_RATE` (default 30) requests per second per caller on `/api/`; 0 
 ### Tests
 
 Store contract tests (both stores): lease lapses and frees the workspace, takeover of a lapsed lock, heartbeat rules, settings validation, delete cascade, one state version fetch. Unit tests for grants (single use, expiry, token shape). e2e `k01` to `k12`. A real-HTTP smoke test against the built binary: download works once without a login, upload with md5 works once, the CLI backend then pulls the uploaded state, a 2-second lease is renewed by a heartbeat and still holds 3 seconds later, delete is refused while locked and succeeds after unlock. 17 mutation checks: all turn a test red (one needed a stronger test first: claiming a run had to notice a lapsed lock before anything else had read the workspace).
+
+## Lint in the plan step (added 2026-11-08, fix P1 from `fixes.md`)
+
+- Crate `tf-lint` (uses `hcl-rs` to read the configuration). `lint(config) -> Vec<LintFinding>` is pure and never panics on odd input; the runner calls it in a blocking task before the engine plans, for every run including speculative plans. Findings are stored with the run (`runs.lint`, migration `0006`), written to the run log (`Lint: N finding(s)` then one line each, scrubbed like every log line), returned as the run's `lint` attribute and listed on the run page.
+- **It never blocks a run.** A linter failure is logged as skipped and planning goes on. There is no "block on errors" setting yet.
+- Rules: `parse-error`, `unused-variable`, `provider-version-missing`, `provider-not-declared`, `required-version-missing`, `variable-without-description`, `variable-without-type`, `hardcoded-secret`, `interpolation-only`. Severities are `warning` or `info`; `error` exists in the type and no rule uses it. A finding for a literal secret names the attribute and never repeats the value.
+- Files joined from an uploaded archive keep their names: a finding says `variables.tf:1`, not a line of the joined text.
+- `unused-variable` is a text scan for `var.<name>`: a use inside a comment or a string counts as a use, so the rule stays quiet when unsure. `provider-not-declared` guesses a resource's provider from the first word of its type (`aws_s3_bucket` is `aws`), which is right for almost every provider and wrong for a few (a provider whose resource types do not start with its name).
+- Not done: no rule configuration, no `# lint:ignore`, no auto-fix, no cost or policy checks, no module-aware rules (modules are not followed), no rules of the `tflint` provider plugins (for example "this instance type does not exist"). It is a first rule set, not a replacement for `tflint`.
+
+Tests: 13 unit tests in `tf-lint`, a store contract test (both stores), e2e `l01` to `l06`, and a real-HTTP check. 12 mutation checks: 11 turn a test red (two needed a stronger test first: one configuration had to use two different resource types of the same provider); the twelfth, accepting a mixed template as a lone interpolation, is an equivalent mutant because the check for a closing brace already rejects it.
+
+## Skipping the refresh and free drift detection (added 2026-11-08, fix P3 from `fixes.md`)
+
+### Skip the refresh
+
+A run can plan without refreshing the state first (`-refresh=false`): the API takes `"refresh": false`, the dashboard form has a "Skip the refresh" box. It is faster and blind to drift, and the run record (`skip-refresh`) and the log say so. **This is not what the most-voted request asks for** (skip the refresh only of resources whose configuration did not change since the last apply, OpenTofu issue 1703); that needs the engine to track it, and the real `tofu` has no such flag. The whole-plan switch is the part a platform can offer today.
+
+### Drift checks
+
+- A drift check is a **refresh-only run** (`plan -refresh-only`): it compares the recorded state with the real infrastructure and reports what changed outside the platform. It is always a speculative run: no lock, never applied, and a real run is never held up by it. The API accepts `"operation": "refresh_only"`; it cannot be combined with `"refresh": false`.
+- Result on the workspace (`drift` attribute): `clean`, `drifted` with the number of resources, or `error`, with the time and the run. A failed check also sets the time, so a schedule waits its interval instead of retrying every tick.
+- **Schedule:** `drift-interval` (seconds) on the workspace, settable by owners and admins through `PATCH /api/v2/workspaces/{id}` (`null` turns it off) or the settings page (minutes, empty = off). The shortest interval is `TF_MIN_DRIFT_INTERVAL_SECS` (default 300). A scheduler task (`drift.rs`) looks every `TF_DRIFT_TICK_SECS` (default 60; 0 turns scheduling off) for workspaces that are due: an interval is set, there is a state, the last check is older than the interval, and no check is already waiting or running (so a slow check cannot pile up).
+- **On request:** `POST /api/v2/workspaces/{id}/actions/check-drift` (anyone who may queue a run) or the "Check for drift now" button; 409 when the workspace has no configuration or no state.
+- It checks against the workspace's latest configuration version that has its content (a version still waiting for its archive is skipped; that also fixed `latest_config`, which used to return such a version).
+- Migration `0007` adds the run options and the workspace's schedule and last result.
+
+### Known limits
+
+- **Real drift was not exercised with a real provider.** The built-in `terraform_data` resource has nothing outside to drift from, so the real-`tofu` test proves the plumbing (the flags, the refresh-only plan, "no drift" parsing); the parsing of `resource_drift` is tested on a sample document written from the plan JSON format, and the end-to-end drift cases use the simulator, where a state entry whose hash starts with `drift:` counts as changed outside. A first check with a real cloud provider is the next thing to verify.
+- It reports only: no notification, no "fix" proposal, no continuous validation of custom conditions.
+- The scheduler is one task per server process: with several instances each looks for due checks (the "already waiting" rule keeps duplicates rare, not impossible).
+- Outputs that change after a refresh count as changes in the summary, as in a plan.
+
+Tests: engine unit tests (simulator refresh-only and skip, `resource_drift` parsing), a real-`tofu` test, store contract tests (options kept, due checks, interval validation, latest configuration), e2e `m01` to `m08`. 14 mutation checks, all turn a test red (one, queuing a check without a state, needed a stronger test first).

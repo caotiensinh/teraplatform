@@ -95,6 +95,9 @@ fn transition(g: &mut Inner, run_id: &str, ev: Event) -> Result<Run> {
     Ok(out)
 }
 
+/// Longest drift check interval: a year.
+pub const MAX_DRIFT_INTERVAL: u64 = 31_536_000;
+
 /// Most characters a workspace description may have.
 pub const MAX_DESCRIPTION: usize = 500;
 
@@ -369,6 +372,8 @@ impl Store for MemoryStore {
             resource_count: 0,
             description: String::new(),
             auto_apply: false,
+            drift_interval: None,
+            drift: None,
             created_at: now(),
         };
         g.workspaces.insert(ws.id.clone(), ws.clone());
@@ -438,7 +443,15 @@ impl Store for MemoryStore {
                 return Err(StoreError::Invalid(format!("the description is limited to {MAX_DESCRIPTION} characters")));
             }
         }
+        if let Some(Some(secs)) = patch.drift_interval {
+            if secs == 0 || secs > MAX_DRIFT_INTERVAL {
+                return Err(StoreError::Invalid(format!("the drift check interval must be from 1 second to {MAX_DRIFT_INTERVAL}")));
+            }
+        }
         let ws = g.workspaces.get_mut(id).ok_or_else(|| nf("workspace"))?;
+        if let Some(d) = patch.drift_interval {
+            ws.drift_interval = d;
+        }
         if let Some(n) = patch.name {
             ws.name = n;
         }
@@ -555,7 +568,7 @@ impl Store for MemoryStore {
 
     async fn latest_config(&self, ws: &str) -> Result<Option<ConfigVersion>> {
         let g = self.g();
-        Ok(g.configs.values().filter(|c| c.workspace_id == ws).max_by_key(|c| (c.created_at, c.id.clone())).cloned())
+        Ok(g.configs.values().filter(|c| c.workspace_id == ws && c.status == "uploaded").max_by_key(|c| (c.created_at, c.id.clone())).cloned())
     }
 
     // ---- variables ----
@@ -630,7 +643,7 @@ impl Store for MemoryStore {
     }
 
     // ---- runs ----
-    async fn create_run(
+    async fn create_run_with(
         &self,
         ws: &str,
         config_version: &str,
@@ -638,7 +651,11 @@ impl Store for MemoryStore {
         message: &str,
         auto_apply: bool,
         source: &str,
+        opts: RunOptions,
     ) -> Result<Run> {
+        if opts.refresh_only && (operation != Operation::PlanOnly || opts.skip_refresh) {
+            return Err(StoreError::Invalid("a refresh-only run must be a plan-only run and cannot skip the refresh".into()));
+        }
         let mut g = self.g();
         if !g.workspaces.contains_key(ws) {
             return Err(nf("workspace"));
@@ -662,6 +679,9 @@ impl Store for MemoryStore {
             changes: Vec::new(),
             input_state_serial: None,
             status_timestamps: [("pending".to_string(), t)].into_iter().collect(),
+            lint: Vec::new(),
+            skip_refresh: opts.skip_refresh,
+            refresh_only: opts.refresh_only,
             created_at: t,
             updated_at: t,
         };
@@ -711,6 +731,34 @@ impl Store for MemoryStore {
         let out = r.clone();
         g.plan_blobs.insert(run.to_string(), self.sealer.seal_plan(run, &blob));
         Ok(out)
+    }
+
+    async fn record_drift(&self, ws: &str, status: DriftStatus) -> Result<()> {
+        self.g().workspaces.get_mut(ws).ok_or_else(|| nf("workspace"))?.drift = Some(status);
+        Ok(())
+    }
+
+    async fn due_drift_checks(&self) -> Result<Vec<Workspace>> {
+        let g = self.g();
+        let t = now();
+        let mut due: Vec<Workspace> = g
+            .workspaces
+            .values()
+            .filter(|w| {
+                let Some(every) = w.drift_interval else { return false };
+                w.current_state_version.is_some()
+                    && w.drift.as_ref().map(|d| d.checked_at.saturating_add(every) <= t).unwrap_or(true)
+                    && !g.runs.values().any(|r| r.workspace_id == w.id && r.refresh_only && matches!(r.status, RunStatus::Pending | RunStatus::Planning))
+            })
+            .cloned()
+            .collect();
+        due.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(due)
+    }
+
+    async fn set_lint(&self, run: &str, findings: Vec<LintFinding>) -> Result<()> {
+        self.g().runs.get_mut(run).ok_or_else(|| nf("run"))?.lint = findings;
+        Ok(())
     }
 
     async fn get_plan_blob(&self, run: &str) -> Result<Vec<u8>> {

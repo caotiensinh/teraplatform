@@ -6,6 +6,7 @@
 use crate::authz::{run_access, ws_access};
 use crate::jsonapi::{self as ja, Doc};
 use crate::{queue_run, queue_run_on, AppState};
+use tf_core::RunOptions;
 use axum::extract::{FromRequest, Path, RawQuery, Request, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -175,12 +176,25 @@ pub struct WorkspaceChanges {
     pub description: Option<String>,
     #[serde(default)]
     pub auto_apply: Option<bool>,
+    /// Seconds between scheduled drift checks; `null` turns them off; left out changes nothing.
+    #[serde(default, deserialize_with = "double_option")]
+    pub drift_interval: Option<Option<u64>>,
+}
+
+/// Tells a missing field (`None`) from an explicit `null` (`Some(None)`).
+fn double_option<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Option<u64>>, D::Error> {
+    Ok(Some(Option::<u64>::deserialize(d)?))
 }
 
 pub async fn update_workspace(State(st): State<AppState>, Extension(p): Extension<Principal>, Path(id): Path<String>, ApiJson(body): ApiJson<Value>) -> ApiResult {
     ws_access(&st, &p, &id, Action::UpdateWorkspace).await?;
     let b: WorkspaceChanges = ja::attributes(body, "workspaces")?;
-    let ws = st.store.update_workspace(&id, WorkspacePatch { name: b.name, description: b.description, auto_apply: b.auto_apply }).await?;
+    if let Some(Some(secs)) = b.drift_interval {
+        if secs < st.cfg.min_drift_interval_secs {
+            return Err(StoreError::Invalid(format!("drift checks can run at most every {} seconds", st.cfg.min_drift_interval_secs)).into());
+        }
+    }
+    let ws = st.store.update_workspace(&id, WorkspacePatch { name: b.name, description: b.description, auto_apply: b.auto_apply, drift_interval: b.drift_interval }).await?;
     Ok(ja::ok(ja::single(ws_res(&ws), vec![])))
 }
 
@@ -223,6 +237,9 @@ pub struct NewRun {
     /// Left out: the workspace's setting decides.
     #[serde(default)]
     pub auto_apply: Option<bool>,
+    /// `false` plans without refreshing the state first (faster, blind to drift). Default `true`.
+    #[serde(default)]
+    pub refresh: Option<bool>,
 }
 
 pub async fn create_run(
@@ -236,12 +253,13 @@ pub async fn create_run(
     let auto_apply = b.auto_apply.unwrap_or(workspace.auto_apply);
     let op = match b.operation.as_deref() {
         None | Some("plan_and_apply") => Operation::PlanAndApply,
-        Some("plan_only") => Operation::PlanOnly,
+        Some("plan_only") | Some("refresh_only") => Operation::PlanOnly,
         Some(o) => return Err(StoreError::Invalid(format!("unknown operation {o}")).into()),
     };
+    let opts = RunOptions { skip_refresh: b.refresh == Some(false), refresh_only: b.operation.as_deref() == Some("refresh_only") };
     let run = match (&b.config, &b.configuration_version_id) {
-        (Some(c), None) => queue_run(&st.store, &ws, c, &b.message, op, auto_apply, "api").await?,
-        (None, Some(cv)) => queue_run_on(&st.store, &ws, cv, &b.message, op, auto_apply, "api").await?,
+        (Some(c), None) => queue_run(&st.store, &ws, c, &b.message, op, auto_apply, "api", opts).await?,
+        (None, Some(cv)) => queue_run_on(&st.store, &ws, cv, &b.message, op, auto_apply, "api", opts).await?,
         (None, None) => return Err(StoreError::Invalid("give the configuration: either config, or a configuration-version relationship".into()).into()),
         (Some(_), Some(_)) => return Err(StoreError::Invalid("give either config or a configuration version, not both".into()).into()),
     };
@@ -405,7 +423,12 @@ pub async fn workspace_action(
     Extension(p): Extension<Principal>,
     Path((id, action)): Path<(String, String)>,
     body: axum::body::Bytes,
-) -> ApiResult {
+) -> Result<Doc, ApiError> {
+    if action == "check-drift" {
+        ws_access(&st, &p, &id, Action::QueueRun).await?;
+        let run = crate::drift::queue_check(&st.store, &id, "api").await?;
+        return Ok(ja::accepted(ja::single(run_res(&run), vec![])));
+    }
     let need = match action.as_str() {
         "lock" | "heartbeat" => Action::Lock,
         "unlock" => Action::Unlock,

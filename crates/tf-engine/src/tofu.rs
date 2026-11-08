@@ -112,6 +112,32 @@ fn parse_plan_json(json: &str) -> Result<(PlanSummary, Vec<ResourceChange>), Eng
     Ok((summary, changes))
 }
 
+/// `(summary, changes)` of a refresh-only plan: what changed in the real infrastructure since the
+/// state was recorded, from the plan's `resource_drift` list (`resource_changes` is empty then).
+fn parse_drift_json(json: &str) -> Result<(PlanSummary, Vec<ResourceChange>), EngineError> {
+    let v: serde_json::Value = serde_json::from_str(json).map_err(|e| EngineError::Failed(format!("could not read the plan: {e}")))?;
+    let mut summary = PlanSummary::default();
+    let mut changes = Vec::new();
+    for rd in v["resource_drift"].as_array().cloned().unwrap_or_default() {
+        let addr = rd["address"].as_str().unwrap_or("?").to_string();
+        let acts: Vec<&str> = rd["change"]["actions"].as_array().map(|a| a.iter().filter_map(|x| x.as_str()).collect()).unwrap_or_default();
+        let action = match acts.as_slice() {
+            ["update"] => ChangeAction::Update,
+            ["delete"] => ChangeAction::Delete,
+            _ => continue,
+        };
+        match action {
+            ChangeAction::Delete => summary.destroy += 1,
+            _ => summary.change += 1,
+        }
+        changes.push(ResourceChange { addr, action });
+    }
+    if let Some(outs) = v["output_changes"].as_object() {
+        summary.outputs = outs.values().filter(|o| o["actions"].as_array().map(|a| a.iter().any(|x| x != "no-op")).unwrap_or(false)).count() as u32;
+    }
+    Ok((summary, changes))
+}
+
 #[async_trait]
 impl Engine for TofuEngine {
     fn name(&self) -> &'static str {
@@ -125,9 +151,19 @@ impl Engine for TofuEngine {
         let result = async {
             let c = vars.cancel.as_ref();
             self.step(&dir, &["init", "-input=false", "-no-color"], &env, sb.init_timeout, log, None, c).await?;
-            self.step(&dir, &["plan", "-input=false", "-no-color", "-out=plan.bin"], &env, sb.plan_timeout, log, None, c).await?;
+            if vars.refresh_only && vars.skip_refresh {
+                return Err(EngineError::Config("a refresh-only run cannot skip the refresh".into()));
+            }
+            let mut plan_args = vec!["plan", "-input=false", "-no-color", "-out=plan.bin"];
+            if vars.skip_refresh {
+                plan_args.push("-refresh=false");
+            }
+            if vars.refresh_only {
+                plan_args.push("-refresh-only");
+            }
+            self.step(&dir, &plan_args, &env, sb.plan_timeout, log, None, c).await?;
             let json = self.step(&dir, &["show", "-json", "plan.bin"], &env, sb.plan_timeout, log, Some(sb.max_plan_json_bytes), c).await?;
-            let (summary, changes) = parse_plan_json(&json)?;
+            let (summary, changes) = if vars.refresh_only { parse_drift_json(&json)? } else { parse_plan_json(&json)? };
             let blob = tokio::fs::read(dir.join("plan.bin")).await.map_err(|e| EngineError::Failed(format!("the plan was not saved: {e}")))?;
             Ok(PlanOutput { summary, changes, blob })
         }
@@ -182,6 +218,22 @@ mod tests {
         assert_eq!(c.len(), 4);
         assert_eq!(c[3].action, ChangeAction::Replace);
         assert!(s.has_changes());
+    }
+
+    #[test]
+    fn a_refresh_only_plan_reports_the_drift_list_not_the_resource_changes() {
+        let json = r#"{"resource_drift":[
+          {"address":"aws_s3_bucket.a","change":{"actions":["update"]}},
+          {"address":"aws_iam_role.b","change":{"actions":["delete"]}},
+          {"address":"aws_x.c","change":{"actions":["no-op"]}}],
+          "resource_changes":[{"address":"aws_s3_bucket.a","change":{"actions":["create"]}}],
+          "output_changes":{"o":{"actions":["update"]}}}"#;
+        let (s, c) = parse_drift_json(json).unwrap();
+        assert_eq!(s, PlanSummary { add: 0, change: 1, destroy: 1, outputs: 1 });
+        assert_eq!(c.iter().map(|x| (x.addr.as_str(), x.action)).collect::<Vec<_>>(), vec![("aws_s3_bucket.a", ChangeAction::Update), ("aws_iam_role.b", ChangeAction::Delete)]);
+        let (s, c) = parse_drift_json(r#"{"resource_changes":[],"resource_drift":[]}"#).unwrap();
+        assert!(c.is_empty() && !s.has_changes(), "no drift is no change");
+        assert!(parse_drift_json("nope").is_err());
     }
 
     #[test]

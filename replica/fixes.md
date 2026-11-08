@@ -95,9 +95,9 @@ Chosen by evidence times how cheaply it can be built here. Size: S (days), M (ab
 
 | # | build | size | skill | evidence |
 | --- | --- | --- | --- | --- |
-| P1 | **Lint in the plan step**: parse the configuration with an HCL parser and run a small rule set (unused variables, missing provider version pins, deprecated syntax, `tofu validate` first) before planning; show findings on the run page | M | replica-build | M1: 211 votes |
+| P1 | **Lint in the plan step** (**done 2026-11-08**, see `backend.md`): parse the configuration with an HCL parser and run a small rule set (unused variables, missing provider version pins, deprecated syntax, `tofu validate` first) before planning; show findings on the run page | M | replica-build | M1: 211 votes |
 | P2 | **Pull-request runs**: a GitHub webhook (and a pull-request comment) starts a speculative plan and posts the result; merge applies | L | replica-backend | M2: 57 matches; also the missing VCS must-have |
-| P3 | **Refresh strategy and free drift detection**: scheduled refresh-only runs report drift; normal plans can skip the refresh of resources whose configuration did not change | M | replica-backend | M4: 131 + 31 votes; H4 |
+| P3 | **Refresh strategy and free drift detection** (**done 2026-11-08**, partly: see `backend.md`): scheduled refresh-only runs report drift; normal plans can skip the refresh of resources whose configuration did not change | M | replica-backend | M4: 131 + 31 votes; H4 |
 | P4 | **Shared provider and module cache** between runs and sandboxes (a mounted cache directory) | S | replica-backend | M5: 62 votes; G9 |
 | P5 | **Run triggers across workspaces** (a simple stack: apply B after A) | L | replica-build | M3: 202 votes |
 | P6 | **Self-hosted runner agent** that pulls work from the server (one small binary) | L | replica-backend | M6 |

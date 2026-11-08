@@ -102,6 +102,42 @@ async fn a_full_cycle_works_with_a_real_binary() {
 }
 
 #[tokio::test]
+async fn a_refresh_only_plan_and_a_plan_without_refresh_run_with_a_real_binary() {
+    let bin = need_tofu!();
+    let e = TofuEngine::new(bin);
+    let (log, lines) = sink();
+    let cfg = cfg_with_var("");
+    let p1 = e.plan(&cfg, None, &vars("one"), &log).await.expect("first plan");
+    let applied = e.apply(&cfg, &p1.blob, None, &vars("one"), &log).await.expect("apply");
+
+    // a drift check: refresh only. The variable changed, but a drift check does not look at the
+    // configuration, and the built-in provider has nothing outside to drift from.
+    let mark = lines.lock().unwrap().len();
+    let mut drift = vars("two");
+    drift.refresh_only = true;
+    let d = e.plan(&cfg, Some(&applied.state), &drift, &log).await.expect("refresh-only plan");
+    assert!(!d.summary.has_changes() && d.changes.is_empty(), "no drift: {:?}", d.summary);
+    let said = lines.lock().unwrap()[mark..].join("
+");
+    assert!(said.contains("-refresh-only"), "tofu was asked for a refresh-only plan: {said}");
+
+    // a plan without the refresh still sees the configuration change
+    let mark = lines.lock().unwrap().len();
+    let mut quick = vars("two");
+    quick.skip_refresh = true;
+    let q = e.plan(&cfg, Some(&applied.state), &quick, &log).await.expect("plan without refresh");
+    assert_eq!((q.summary.add, q.summary.change, q.summary.destroy), (0, 1, 0));
+    assert!(lines.lock().unwrap()[mark..].join("
+").contains("-refresh=false"));
+
+    // the two together make no sense
+    let mut both = vars("one");
+    both.refresh_only = true;
+    both.skip_refresh = true;
+    assert!(matches!(e.plan(&cfg, Some(&applied.state), &both, &log).await, Err(EngineError::Config(_))));
+}
+
+#[tokio::test]
 async fn a_change_that_only_touches_outputs_is_still_a_change() {
     let bin = need_tofu!();
     let e = TofuEngine::new(bin);

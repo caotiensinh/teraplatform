@@ -4,6 +4,7 @@
 
 use crate::authz::{run_access, ws_access};
 use crate::{queue_run, run_event, AppState};
+use tf_core::RunOptions;
 use axum::body::Bytes;
 use axum::extract::{Form, Path, State};
 use axum::http::{header, StatusCode};
@@ -83,6 +84,24 @@ fn ago(ts: u64) -> String {
         60..=3599 => format!("{}m ago", d / 60),
         3600..=86399 => format!("{}h ago", d / 3600),
         _ => format!("{}d ago", d / 86400),
+    }
+}
+
+/// The drift stat of a workspace: when it was last checked and what was found.
+fn drift_text(ws: &Workspace) -> String {
+    match &ws.drift {
+        None => match ws.drift_interval {
+            Some(_) => "scheduled".into(),
+            None => "never checked".into(),
+        },
+        Some(d) => {
+            let what = match d.status.as_str() {
+                "clean" => "none".to_string(),
+                "drifted" => format!("{} changed", d.changes),
+                _ => "check failed".to_string(),
+            };
+            format!("{what} <span class=\"muted\" style=\"font-size:12px\">{}</span>", ago(d.checked_at))
+        }
     }
 }
 
@@ -362,6 +381,7 @@ pub async fn workspace(State(st): State<AppState>, Extension(p): Extension<Princ
 <div class=\"form-row\" style=\"margin-top:12px\"><div class=\"field\" style=\"flex:1;min-width:200px\"><label class=\"sr-only\" for=\"message\">Message</label><input id=\"message\" name=\"message\" placeholder=\"Message (optional)\" maxlength=\"200\"></div>\
 <label class=\"sr-only\" for=\"mode\">Mode</label><select id=\"mode\" name=\"mode\"><option value=\"plan_and_apply\">Plan and apply</option><option value=\"plan_only\">Plan only (speculative)</option></select>\
 <label><input type=\"checkbox\" name=\"auto_apply\" value=\"on\"{auto}> Apply automatically after a clean plan</label>\
+<label title=\"Plans faster but cannot see changes made outside the platform\"><input type=\"checkbox\" name=\"skip_refresh\" value=\"on\"> Skip the refresh</label>\
 <button class=\"btn btn-primary\" type=\"submit\">Queue run</button></div></form></div></div>",
             id = esc(&ws.id),
             config = esc(&config),
@@ -378,7 +398,8 @@ pub async fn workspace(State(st): State<AppState>, Extension(p): Extension<Princ
 <div class=\"stat\"><div class=\"k\">State serial</div><div class=\"v\">{serial}</div></div>\
 <div class=\"stat\"><div class=\"k\">Runs</div><div class=\"v\">{nruns}</div></div>\
 <div class=\"stat\"><div class=\"k\">Variables</div><div class=\"v\">{nvars}</div></div>\
-<div class=\"stat\"><div class=\"k\">Lock</div><div class=\"v\">{lockv}</div></div></div>{queue}{cli}\
+<div class=\"stat\"><div class=\"k\">Lock</div><div class=\"v\">{lockv}</div></div>\
+<div class=\"stat\" id=\"drift\"><div class=\"k\">Drift</div><div class=\"v\">{driftv}</div></div></div>{drift_actions}{queue}{cli}\
 <h2 class=\"sec\">Runs</h2>{runs_html}\
 <p class=\"muted\" style=\"margin-top:16px\"><a href=\"/workspaces/{id}/variables\">Variables</a> · <a href=\"/workspaces/{id}/states\">State versions</a> · <a href=\"/workspaces/{id}/settings\">Settings</a></p>",
         name = esc(&ws.name),
@@ -387,6 +408,12 @@ pub async fn workspace(State(st): State<AppState>, Extension(p): Extension<Princ
         serial = state.as_ref().map(|s| s.serial.to_string()).unwrap_or_else(|| "-".into()),
         nruns = runs.len(),
         lockv = if ws.lock.is_some() { "locked" } else { "free" },
+        driftv = drift_text(&ws),
+        drift_actions = if can_run && state.is_some() {
+            format!("<form class=\"inline\" method=\"post\" action=\"/workspaces/{}/check-drift\" style=\"display:block;margin:-4px 0 12px\"><button class=\"btn btn-secondary btn-sm\" type=\"submit\">Check for drift now</button> <span class=\"muted\">A drift check only compares the state with the real infrastructure; it changes nothing.</span></form>", esc(&ws.id))
+        } else {
+            String::new()
+        },
         cli = cli,
     );
     page(&st, &p, &ws.name, "workspaces", body, false).await
@@ -401,12 +428,15 @@ pub struct NewRunForm {
     mode: String,
     #[serde(default)]
     auto_apply: String,
+    #[serde(default)]
+    skip_refresh: String,
 }
 
 pub async fn create_run(State(st): State<AppState>, Extension(p): Extension<Principal>, Path(id): Path<String>, Form(f): Form<NewRunForm>) -> Result<Redirect, WebError> {
     ws_access(&st, &p, &id, Action::QueueRun).await?;
     let op = if f.mode == "plan_only" { Operation::PlanOnly } else { Operation::PlanAndApply };
-    let run = queue_run(&st.store, &id, &f.config, f.message.trim(), op, f.auto_apply == "on", "ui").await?;
+    let opts = RunOptions { skip_refresh: f.skip_refresh == "on", refresh_only: false };
+    let run = queue_run(&st.store, &id, &f.config, f.message.trim(), op, f.auto_apply == "on", "ui", opts).await?;
     Ok(Redirect::to(&format!("/runs/{}", run.id)))
 }
 
@@ -416,6 +446,12 @@ pub struct LockForm {
     reason: String,
     #[serde(default)]
     force: String,
+}
+
+pub async fn check_drift(State(st): State<AppState>, Extension(p): Extension<Principal>, Path(id): Path<String>) -> Result<Redirect, WebError> {
+    ws_access(&st, &p, &id, Action::QueueRun).await?;
+    let run = crate::drift::queue_check(&st.store, &id, "ui").await?;
+    Ok(Redirect::to(&format!("/runs/{}", run.id)))
 }
 
 pub async fn lock(State(st): State<AppState>, Extension(p): Extension<Principal>, Path(id): Path<String>, Form(f): Form<LockForm>) -> Result<Redirect, WebError> {
@@ -711,12 +747,36 @@ pub async fn run(State(st): State<AppState>, Extension(p): Extension<Principal>,
     let streaming = !run.status.is_final() && run.status != RunStatus::NeedsConfirmation;
     let refresh = if streaming { Refresh::NoScript } else { Refresh::No };
     let stream_attrs = if streaming { format!(" id=\"run-stream\" data-events=\"/runs/{rid}/events\"") } else { String::new() };
+    let lint_html = if run.lint.is_empty() {
+        String::new()
+    } else {
+        let mut rows = String::new();
+        for f in &run.lint {
+            let at = match (&f.file, f.line) {
+                (Some(file), Some(l)) => format!("{}:{l}", esc(file)),
+                (None, Some(l)) => format!("line {l}"),
+                _ => String::new(),
+            };
+            let class = match f.severity.as_str() {
+                "error" => "del",
+                "warning" => "chg",
+                _ => "",
+            };
+            rows.push_str(&format!(
+                "<div class=\"diff-row {class}\"><span class=\"sym\">!</span><span>{} <span class=\"muted\">{}</span></span><span class=\"muted mono\">{}</span></div>",
+                esc(&f.message),
+                esc(&f.rule),
+                at
+            ));
+        }
+        format!("<h2 class=\"sec\">Lint ({})</h2><div class=\"diff\" id=\"lint\">{rows}</div><p class=\"muted\" style=\"margin:4px 0 0\">Findings never stop a run.</p>", run.lint.len())
+    };
     let stream_js = if streaming { STREAM_JS } else { "" };
     let body = format!(
         "<div class=\"page-header\"><div><div class=\"crumbs\"><a href=\"/workspaces\">Workspaces</a> / <a href=\"/workspaces/{wid}\">{wname}</a> / runs</div>\
 <h1><span class=\"mono\">run-{short}</span> {badge}</h1></div></div>{lock_banner}{failed_banner}{force_banner}{stepper}{stats}\
 <div class=\"cols\"><div><h2 class=\"sec\" style=\"margin-top:0\">Resource changes</h2>{changes_html}\
-<h2 class=\"sec\">Log</h2><div class=\"log\" role=\"log\" aria-live=\"off\"{stream_attrs} data-status=\"{status}\" data-lines=\"{nlines}\">{log}</div></div><aside>{details}</aside></div>{actionbar}{stream_js}",
+{lint_html}<h2 class=\"sec\">Log</h2><div class=\"log\" role=\"log\" aria-live=\"off\"{stream_attrs} data-status=\"{status}\" data-lines=\"{nlines}\">{log}</div></div><aside>{details}</aside></div>{actionbar}{stream_js}",
         wid = esc(&ws.id),
         wname = esc(&ws.name),
         short = esc(short(&run.id)),
@@ -884,11 +944,15 @@ async fn settings_view(st: &AppState, p: &Principal, ws: &Workspace, error: Opti
 <div class=\"hint\">Letters, numbers, dash and underscore. The OpenTofu backend address uses the name, so renaming means updating <span class=\"mono\">address</span> in the CLI configuration.</div></div>\
 <div class=\"field\"><label for=\"description\">Description</label><input id=\"description\" name=\"description\" value=\"{desc}\" maxlength=\"500\"{dis}></div>\
 <label><input type=\"checkbox\" name=\"auto_apply\" value=\"on\"{auto}{dis}> Apply automatically after a clean plan (the default for new runs; a run can still ask otherwise)</label>\
+<div class=\"field\"><label for=\"drift_minutes\">Check for drift every (minutes)</label><input id=\"drift_minutes\" name=\"drift_minutes\" value=\"{drift}\" inputmode=\"numeric\" placeholder=\"off\" style=\"max-width:140px\"{dis}>\
+<div class=\"hint\">Leave empty to check only when asked. A check refreshes the state against the real infrastructure and reports what changed outside the platform; it never changes anything. Shortest: {min} minutes.</div></div>\
 {save}</form></div></div>",
         id = esc(&ws.id),
         name = esc(&ws.name),
         desc = esc(&ws.description),
         auto = if ws.auto_apply { " checked" } else { "" },
+        drift = ws.drift_interval.map(|s| (s / 60).max(1).to_string()).unwrap_or_default(),
+        min = (st.cfg.min_drift_interval_secs / 60).max(1),
         save = if can_edit { "<div><button class=\"btn btn-primary\" type=\"submit\">Save settings</button></div>" } else { "<p class=\"muted\">Only owners and admins can change these.</p>" },
     );
     let danger = if can_delete {
@@ -924,11 +988,24 @@ pub struct SettingsForm {
     description: String,
     #[serde(default)]
     auto_apply: String,
+    #[serde(default)]
+    drift_minutes: String,
 }
 
 pub async fn save_settings(State(st): State<AppState>, Extension(p): Extension<Principal>, Path(id): Path<String>, Form(f): Form<SettingsForm>) -> Result<Response, WebError> {
     let ws = ws_access(&st, &p, &id, Action::UpdateWorkspace).await?;
-    let patch = WorkspacePatch { name: Some(f.name.trim().to_string()), description: Some(f.description.trim().to_string()), auto_apply: Some(f.auto_apply == "on") };
+    let drift_interval = match f.drift_minutes.trim() {
+        "" => Some(None),
+        m => match m.parse::<u64>() {
+            Ok(n) if n >= 1 && n.saturating_mul(60) >= st.cfg.min_drift_interval_secs => Some(Some(n * 60)),
+            _ => {
+                let msg = format!("The drift check interval is a whole number of minutes, at least {}.", (st.cfg.min_drift_interval_secs / 60).max(1));
+                let html = settings_view(&st, &p, &ws, Some(msg)).await?;
+                return Ok((StatusCode::UNPROCESSABLE_ENTITY, html).into_response());
+            }
+        },
+    };
+    let patch = WorkspacePatch { name: Some(f.name.trim().to_string()), description: Some(f.description.trim().to_string()), auto_apply: Some(f.auto_apply == "on"), drift_interval };
     match st.store.update_workspace(&id, patch).await {
         Ok(_) => Ok(Redirect::to(&format!("/workspaces/{id}/settings")).into_response()),
         Err(e @ (StoreError::Invalid(_) | StoreError::Conflict(_))) => {
@@ -979,6 +1056,9 @@ mod tests {
             summary: planned.then(PlanSummary::default),
             changes: vec![],
             input_state_serial: None,
+            lint: vec![],
+            skip_refresh: false,
+            refresh_only: false,
             status_timestamps: stamps.iter().map(|(k, v)| (k.to_string(), *v)).collect::<BTreeMap<_, _>>(),
             created_at: 0,
             updated_at: 0,

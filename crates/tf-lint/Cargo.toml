@@ -1,0 +1,9 @@
+[package]
+name = "tf-lint"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tf-core = { path = "../tf-core" }
+hcl-rs = "0.20"

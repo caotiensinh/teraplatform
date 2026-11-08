@@ -140,6 +140,7 @@ pub trait Store: Send + Sync {
     async fn variables_for_run(&self, ws: &str) -> Result<Vec<Variable>>;
 
     // ---- runs ----
+    /// A plain run: see `create_run_with` for the options.
     async fn create_run(
         &self,
         ws: &str,
@@ -148,6 +149,22 @@ pub trait Store: Send + Sync {
         message: &str,
         auto_apply: bool,
         source: &str,
+    ) -> Result<Run> {
+        self.create_run_with(ws, config_version, operation, message, auto_apply, source, RunOptions::default()).await
+    }
+
+    /// Queues a run. A refresh-only run (a drift check) must be a plan-only run and cannot skip the
+    /// refresh; anything else is Invalid.
+    #[allow(clippy::too_many_arguments)]
+    async fn create_run_with(
+        &self,
+        ws: &str,
+        config_version: &str,
+        operation: Operation,
+        message: &str,
+        auto_apply: bool,
+        source: &str,
+        opts: RunOptions,
     ) -> Result<Run>;
     async fn get_run(&self, id: &str) -> Result<Run>;
     /// Newest first. `None` lists every run.
@@ -156,6 +173,14 @@ pub trait Store: Send + Sync {
     /// Moves a run through the state machine and releases its lock when it stops holding it.
     async fn apply_event(&self, run: &str, event: Event) -> Result<Run>;
     async fn set_plan(&self, run: &str, summary: PlanSummary, changes: Vec<ResourceChange>, blob: Vec<u8>) -> Result<Run>;
+    /// Records what the lint step found. Replaces any earlier findings of the run.
+    async fn set_lint(&self, run: &str, findings: Vec<LintFinding>) -> Result<()>;
+    /// Records the outcome of a drift check on the workspace.
+    async fn record_drift(&self, ws: &str, status: DriftStatus) -> Result<()>;
+    /// Workspaces whose scheduled drift check is due: an interval is set, there is a state to refresh,
+    /// no drift check is already waiting or working, and the last one is older than the interval (or
+    /// there was none).
+    async fn due_drift_checks(&self) -> Result<Vec<Workspace>>;
     async fn get_plan_blob(&self, run: &str) -> Result<Vec<u8>>;
     /// Atomically picks the next piece of work. Enforces one executing run per workspace.
     async fn claim_next(&self) -> Result<Option<Claim>>;
@@ -217,6 +242,10 @@ macro_rules! all_contract_tests {
             workspace_settings_change_and_are_validated,
             a_workspace_is_deleted_with_everything_in_it,
             a_single_state_version_can_be_fetched,
+            lint_findings_are_kept_with_the_run,
+            run_options_are_kept_and_a_drift_check_must_be_speculative,
+            drift_checks_fall_due_by_their_interval,
+            the_latest_configuration_is_one_that_has_its_content,
             logs_keep_order,
             plans_and_state_round_trip_through_sealing,
             users_orgs_and_roles,

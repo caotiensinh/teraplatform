@@ -264,6 +264,12 @@ pub struct Workspace {
     pub description: String,
     /// New runs apply by themselves after a clean plan unless the request says otherwise.
     pub auto_apply: bool,
+    /// Check for drift on this schedule (seconds); `None`: only when asked.
+    #[serde(default)]
+    pub drift_interval: Option<u64>,
+    /// The latest drift check, if any.
+    #[serde(default)]
+    pub drift: Option<DriftStatus>,
     pub created_at: u64,
 }
 
@@ -273,6 +279,8 @@ pub struct WorkspacePatch {
     pub name: Option<String>,
     pub description: Option<String>,
     pub auto_apply: Option<bool>,
+    /// `Some(None)` turns scheduled drift checks off, `Some(Some(n))` sets the interval in seconds.
+    pub drift_interval: Option<Option<u64>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -300,8 +308,52 @@ pub struct Run {
     pub changes: Vec<ResourceChange>,
     pub input_state_serial: Option<u64>,
     pub status_timestamps: BTreeMap<String, u64>,
+    /// What the lint step found in the configuration before planning. Never blocks the run.
+    #[serde(default)]
+    pub lint: Vec<LintFinding>,
+    /// Planned without refreshing the state first (`-refresh=false`): faster, but blind to drift.
+    #[serde(default)]
+    pub skip_refresh: bool,
+    /// A drift check: only refreshes the state against the real infrastructure and reports what moved.
+    /// Always a speculative run (it takes no lock and cannot be applied).
+    #[serde(default)]
+    pub refresh_only: bool,
     pub created_at: u64,
     pub updated_at: u64,
+}
+
+/// How a run differs from a plain plan.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RunOptions {
+    pub skip_refresh: bool,
+    pub refresh_only: bool,
+}
+
+/// The outcome of the latest drift check of a workspace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DriftStatus {
+    pub checked_at: u64,
+    pub run_id: Option<Id>,
+    /// `clean`, `drifted` or `error`.
+    pub status: String,
+    /// Resources found changed (or gone) outside the platform.
+    pub changes: u32,
+}
+
+/// One finding of the lint step.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LintFinding {
+    /// Stable rule name, such as `unused-variable`.
+    pub rule: String,
+    /// `error`, `warning` or `info`.
+    pub severity: String,
+    pub message: String,
+    /// The file, when the configuration came from an archive of several files.
+    #[serde(default)]
+    pub file: Option<String>,
+    /// 1-based line within that file (or within the configuration text).
+    #[serde(default)]
+    pub line: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

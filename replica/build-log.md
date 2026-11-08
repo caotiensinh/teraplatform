@@ -117,3 +117,17 @@ then `cargo clean` and switched the dev profile to `debug = "line-tables-only"`,
 - Custom themes in `themes.json` (the default consumer-app themes matched unrelated text). Counts are keyword matches; samples were read by hand and the precision is stated in `fixes.md`.
 - A first filter for hiring posts wrongly removed 71 real comments (a "$10k/mo" matched a salary pattern); found when a quote failed its exact-substring check; fixed.
 - Output: `feedback.md`, `fixes.md` (three lists, fix plan P1 to P7, three angles), five new rows in `features.csv`, gap verdicts in `gaps.md`.
+
+## 2026-11-08: lint in the plan step (fix P1)
+
+- New crate `tf-lint` with nine rules; `Run.lint`, `Store::set_lint`, migration `0006`; the runner lints before every plan; the run page, log and API show the findings; they never stop a run.
+- The first draft of the "provider not declared" rule fires on configurations with no `terraform` block at all, which is most of the sample configurations in the tests; it only adds log lines, and it is a deliberate warning (pinning providers is the habit this rule teaches).
+- Test timing: lease tests used 1-second leases, but a lease counted in whole seconds can lapse after a fraction of one, so they flaked; they now use 2 seconds and wait 3.2.
+- 12 mutation checks: 11 turn a test red (two needed a stronger test first: one configuration had to use two different resource types of the same provider); the twelfth, accepting a mixed template as a lone interpolation, is an equivalent mutant because the check for a closing brace already rejects it.
+
+## 2026-11-08: skip the refresh, drift checks (fix P3)
+
+- Run options `skip_refresh` and `refresh_only` (migration `0007`), `Store::create_run_with`, drift schedule and last result on the workspace, a scheduler task, the `check-drift` action, settings page and workspace page changes. The engine passes `-refresh=false` / `-refresh-only` to tofu and reads `resource_drift` for the drift list.
+- **Found on the way:** `latest_config` returned a configuration version that was still waiting for its upload (empty text); a drift check would have planned against nothing. Fixed in both stores, with a contract test.
+- Limits stated in `backend.md`: real drift not exercised with a real provider; the 131-vote request (skip refresh only for unchanged resources) is not what a whole-plan switch does.
+- 277 tests (was 259), run on PostgreSQL with the real tofu and Docker cases, none skipped; 14 mutation checks, all turn a test red (one, queuing a check without a state, needed a stronger test first).

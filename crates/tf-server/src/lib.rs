@@ -6,6 +6,7 @@ pub mod archive;
 pub mod auth;
 pub mod authz;
 pub mod backend;
+pub mod drift;
 pub mod grants;
 pub mod jsonapi;
 pub mod runner;
@@ -18,7 +19,7 @@ use axum::routing::{any, delete, get, post, put};
 use axum::Router;
 use std::sync::Arc;
 use std::time::Duration;
-use tf_core::{actions, Event, Operation, Run};
+use tf_core::{actions, Event, Operation, Run, RunOptions};
 use tf_store::{Result as StoreResult, Store, StoreError};
 
 /// Longest run message, in characters.
@@ -48,7 +49,8 @@ impl AppState {
     }
 }
 
-/// Saves the configuration and queues a run on it.
+/// Saves the configuration and queues a run on it. Every parameter is spelled out on purpose.
+#[allow(clippy::too_many_arguments)]
 pub async fn queue_run(
     store: &Arc<dyn Store>,
     workspace_id: &str,
@@ -57,6 +59,7 @@ pub async fn queue_run(
     operation: Operation,
     auto_apply: bool,
     source: &str,
+    opts: RunOptions,
 ) -> StoreResult<Run> {
     if message.chars().count() > MAX_MESSAGE {
         return Err(StoreError::Invalid(format!("the message is limited to {MAX_MESSAGE} characters")));
@@ -65,7 +68,7 @@ pub async fn queue_run(
         return Err(StoreError::Invalid("the configuration is limited to 1 MB".into()));
     }
     let cv = store.create_config_version(workspace_id, config, source).await?;
-    store.create_run(workspace_id, &cv.id, operation, message, auto_apply, source).await
+    store.create_run_with(workspace_id, &cv.id, operation, message, auto_apply, source, opts).await
 }
 
 /// Queues a run on a configuration version that was uploaded earlier. The store checks that the
@@ -78,11 +81,12 @@ pub async fn queue_run_on(
     operation: Operation,
     auto_apply: bool,
     source: &str,
+    opts: RunOptions,
 ) -> StoreResult<Run> {
     if message.chars().count() > MAX_MESSAGE {
         return Err(StoreError::Invalid(format!("the message is limited to {MAX_MESSAGE} characters")));
     }
-    store.create_run(workspace_id, config_version_id, operation, message, auto_apply, source).await
+    store.create_run_with(workspace_id, config_version_id, operation, message, auto_apply, source, opts).await
 }
 
 /// How long a force-cancel waits for the runner to finish with the stopped step before the
@@ -136,6 +140,7 @@ pub fn app(state: AppState) -> Router {
         .route("/workspaces/{id}/unlock", post(web::unlock))
         .route("/workspaces/{id}/states", get(web::states))
         .route("/workspaces/{id}/settings", get(web::settings).post(web::save_settings))
+        .route("/workspaces/{id}/check-drift", post(web::check_drift))
         .route("/workspaces/{id}/delete", post(web::delete_workspace))
         .route("/workspaces/{id}/variables", get(web::variables).post(web::set_variable))
         .route("/workspaces/{id}/variables/{var_id}/delete", post(web::delete_variable))

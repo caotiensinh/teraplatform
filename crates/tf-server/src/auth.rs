@@ -37,11 +37,15 @@ pub struct Config {
     /// How long a lock taken by the OpenTofu CLI lasts. The CLI cannot renew it, so this must outlast
     /// its longest apply (0: no expiry).
     pub cli_lock_lease_secs: u64,
+    /// Shortest interval a workspace may ask for scheduled drift checks, in seconds.
+    pub min_drift_interval_secs: u64,
+    /// How often the scheduler looks for drift checks that are due, in seconds (0 turns scheduling off).
+    pub drift_tick_secs: u64,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { cookie_secure: false, require_verified: false, base_url: "http://127.0.0.1:8080".into(), session_ttl: DEFAULT_TTL, api_rate_per_sec: 30, api_lock_lease_secs: 3600, cli_lock_lease_secs: 12 * 3600 }
+        Self { cookie_secure: false, require_verified: false, base_url: "http://127.0.0.1:8080".into(), session_ttl: DEFAULT_TTL, api_rate_per_sec: 30, api_lock_lease_secs: 3600, cli_lock_lease_secs: 12 * 3600, min_drift_interval_secs: 300, drift_tick_secs: 60 }
     }
 }
 

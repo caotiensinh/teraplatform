@@ -60,7 +60,7 @@ fn user_cols() -> String {
 fn run_cols() -> String {
     format!(
         "id, workspace_id, config_version_id, status, operation, source, message, auto_apply, summary, changes, \
-         input_state_serial, status_timestamps, {EPOCH} created_at)::bigint as created_at, \
+         input_state_serial, status_timestamps, lint, skip_refresh, refresh_only, {EPOCH} created_at)::bigint as created_at, \
          {EPOCH} updated_at)::bigint as updated_at"
     )
 }
@@ -69,7 +69,8 @@ fn ws_cols() -> String {
     format!(
         "id, org_id, name, lock_owner, lock_reason, lock_info, {EPOCH} lock_since)::bigint as lock_since, \
          {EPOCH} lock_expires_at)::bigint as lock_expires_at, current_run, \
-         current_state_version, resource_count, description, auto_apply, {EPOCH} created_at)::bigint as created_at"
+         current_state_version, resource_count, description, auto_apply, drift_interval, drift_run, drift_status, drift_changes, \
+         {EPOCH} drift_checked_at)::bigint as drift_checked_at, {EPOCH} created_at)::bigint as created_at"
     )
 }
 
@@ -101,6 +102,13 @@ fn ws_from(r: &PgRow) -> Workspace {
         resource_count: r.get::<i32, _>("resource_count") as usize,
         description: r.get("description"),
         auto_apply: r.get("auto_apply"),
+        drift_interval: r.get::<Option<i64>, _>("drift_interval").map(|d| d as u64),
+        drift: r.get::<Option<String>, _>("drift_status").map(|status| DriftStatus {
+            checked_at: r.get::<Option<i64>, _>("drift_checked_at").unwrap_or(0) as u64,
+            run_id: r.get("drift_run"),
+            status,
+            changes: r.get::<Option<i32>, _>("drift_changes").unwrap_or(0) as u32,
+        }),
         created_at: r.get::<i64, _>("created_at") as u64,
     }
 }
@@ -109,6 +117,7 @@ fn run_from(r: &PgRow) -> Result<Run> {
     let summary: Option<Json<PlanSummary>> = r.get("summary");
     let changes: Json<Vec<ResourceChange>> = r.get("changes");
     let stamps: Json<std::collections::BTreeMap<String, u64>> = r.get("status_timestamps");
+    let lint: Json<Vec<LintFinding>> = r.get("lint");
     Ok(Run {
         id: r.get("id"),
         workspace_id: r.get("workspace_id"),
@@ -122,6 +131,9 @@ fn run_from(r: &PgRow) -> Result<Run> {
         changes: changes.0,
         input_state_serial: r.get::<Option<i64>, _>("input_state_serial").map(|s| s as u64),
         status_timestamps: stamps.0,
+        lint: lint.0,
+        skip_refresh: r.get("skip_refresh"),
+        refresh_only: r.get("refresh_only"),
         created_at: r.get::<i64, _>("created_at") as u64,
         updated_at: r.get::<i64, _>("updated_at") as u64,
     })
@@ -615,9 +627,15 @@ impl Store for PgStore {
                 return Err(StoreError::Invalid("the description is limited to 500 characters".into()));
             }
         }
+        if let Some(Some(secs)) = patch.drift_interval {
+            if secs == 0 || secs > 31_536_000 {
+                return Err(StoreError::Invalid("the drift check interval must be from 1 second to 31536000".into()));
+            }
+        }
         let name = patch.name.clone();
         let r = sqlx::query(&format!(
-            "update workspaces set name = coalesce($2, name), description = coalesce($3, description), auto_apply = coalesce($4, auto_apply) \
+            "update workspaces set name = coalesce($2, name), description = coalesce($3, description), auto_apply = coalesce($4, auto_apply), \
+             drift_interval = case when $5 then $6 else drift_interval end \
              where id = $1 returning {}",
             ws_cols()
         ))
@@ -625,6 +643,8 @@ impl Store for PgStore {
         .bind(patch.name)
         .bind(patch.description)
         .bind(patch.auto_apply)
+        .bind(patch.drift_interval.is_some())
+        .bind(patch.drift_interval.flatten().map(|d| d as i64))
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| match db(e) {
@@ -771,7 +791,7 @@ impl Store for PgStore {
     }
 
     async fn latest_config(&self, ws: &str) -> Result<Option<ConfigVersion>> {
-        let r = sqlx::query("select id, workspace_id, source, text, status, extract(epoch from created_at)::bigint as created_at from configuration_versions where workspace_id = $1 order by created_at desc, id desc limit 1")
+        let r = sqlx::query("select id, workspace_id, source, text, status, extract(epoch from created_at)::bigint as created_at from configuration_versions where workspace_id = $1 and status = 'uploaded' order by created_at desc, id desc limit 1")
             .bind(ws)
             .fetch_optional(&self.pool)
             .await
@@ -843,7 +863,7 @@ impl Store for PgStore {
     }
 
     // ---- runs ----
-    async fn create_run(
+    async fn create_run_with(
         &self,
         ws: &str,
         config_version: &str,
@@ -851,7 +871,11 @@ impl Store for PgStore {
         message: &str,
         auto_apply: bool,
         source: &str,
+        opts: RunOptions,
     ) -> Result<Run> {
+        if opts.refresh_only && (operation != Operation::PlanOnly || opts.skip_refresh) {
+            return Err(StoreError::Invalid("a refresh-only run must be a plan-only run and cannot skip the refresh".into()));
+        }
         let mut tx = self.pool.begin().await.map_err(db)?;
         let ok = sqlx::query("select status from configuration_versions where id = $1 and workspace_id = $2")
             .bind(config_version)
@@ -869,8 +893,8 @@ impl Store for PgStore {
             return Err(if exists.is_none() { nf("workspace") } else { StoreError::NotFound("configuration version not found in this workspace".into()) });
         }
         let r = sqlx::query(&format!(
-            "insert into runs (workspace_id, config_version_id, status, operation, source, message, auto_apply, status_timestamps) \
-             values ($1,$2,'pending',$3,$4,$5,$6, jsonb_build_object('pending', extract(epoch from now())::bigint)) returning {}",
+            "insert into runs (workspace_id, config_version_id, status, operation, source, message, auto_apply, skip_refresh, refresh_only, status_timestamps) \
+             values ($1,$2,'pending',$3,$4,$5,$6,$7,$8, jsonb_build_object('pending', extract(epoch from now())::bigint)) returning {}",
             run_cols()
         ))
         .bind(ws)
@@ -879,6 +903,8 @@ impl Store for PgStore {
         .bind(source)
         .bind(message)
         .bind(auto_apply)
+        .bind(opts.skip_refresh)
+        .bind(opts.refresh_only)
         .fetch_one(&mut *tx)
         .await
         .map_err(db)?;
@@ -941,6 +967,44 @@ impl Store for PgStore {
         .map_err(db)?
         .ok_or_else(|| nf("run"))?;
         run_from(&r)
+    }
+
+    async fn record_drift(&self, ws: &str, status: DriftStatus) -> Result<()> {
+        let done = sqlx::query("update workspaces set drift_checked_at = to_timestamp($2), drift_run = $3, drift_status = $4, drift_changes = $5 where id = $1")
+            .bind(ws)
+            .bind(status.checked_at as f64)
+            .bind(&status.run_id)
+            .bind(&status.status)
+            .bind(status.changes as i32)
+            .execute(&self.pool)
+            .await
+            .map_err(db)?;
+        if done.rows_affected() == 0 {
+            return Err(nf("workspace"));
+        }
+        Ok(())
+    }
+
+    async fn due_drift_checks(&self) -> Result<Vec<Workspace>> {
+        let rows = sqlx::query(&format!(
+            "select {} from workspaces w where drift_interval is not null and current_state_version is not null \
+             and (drift_checked_at is null or drift_checked_at + (drift_interval * interval '1 second') <= now()) \
+             and not exists (select 1 from runs r where r.workspace_id = w.id and r.refresh_only and r.status in ('pending','planning')) \
+             order by id",
+            ws_cols()
+        ))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+        Ok(rows.iter().map(ws_from).collect())
+    }
+
+    async fn set_lint(&self, run: &str, findings: Vec<LintFinding>) -> Result<()> {
+        let done = sqlx::query("update runs set lint = $2 where id = $1").bind(run).bind(Json(&findings)).execute(&self.pool).await.map_err(db)?;
+        if done.rows_affected() == 0 {
+            return Err(nf("run"));
+        }
+        Ok(())
     }
 
     async fn get_plan_blob(&self, run: &str) -> Result<Vec<u8>> {

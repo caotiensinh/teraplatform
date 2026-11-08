@@ -44,7 +44,7 @@ Three tiers, named by who they are for:
 | resources, workspaces | unlimited | unlimited | unlimited |
 | concurrent runs | 2 | 10 | 50 |
 | state, locking, variables, plan / confirm / apply, API, CLI backend | yes | yes | yes |
-| pull-request plans, lint in the plan, free drift detection (**planned**) | lint only | yes | yes |
+| lint in the plan (**built**), pull-request plans and free drift detection (**planned**) | lint | lint; the rest when built | lint; the rest when built |
 | audit log | no | 90 days | 1 year |
 | runner agents, SSO (**planned**) | no | no | yes |
 | support | community | email, 2 business days | email, 1 business day |
@@ -70,8 +70,8 @@ The research mostly complains about the *model* (per resource), not about cancel
 
 ## What is real today (this decides what may be sold)
 
-- **Built:** accounts and roles, workspaces and settings, state with locks and leases, plan / confirm / apply with a real `tofu` in a sandbox, live logs, force-cancel, the JSON:API, the OpenTofu http backend, archive upload, rate limit.
-- **Not built, so not for sale:** pull-request plans, lint in the plan step, drift runs (all three are fixes P1 to P3 in `fixes.md`), runner agents, SSO, audit log, billing itself, and a hosted service. There is no Stripe code and no seat or run counting in the product. **Until those exist the honest offer is a free self-hosted beta**; the table above becomes true feature by feature, and a tier should not be charged for a row marked planned.
+- **Built:** lint in the plan step (nine rules, never blocks), drift checks on a schedule or on request, accounts and roles, workspaces and settings, state with locks and leases, plan / confirm / apply with a real `tofu` in a sandbox, live logs, force-cancel, the JSON:API, the OpenTofu http backend, archive upload, rate limit.
+- **Not built, so not for sale:** pull-request plans (fix P2 in `fixes.md`; P1 lint and P3 drift checks are built, but drift has not been run against a real cloud provider yet), runner agents, SSO, audit log, billing itself, and a hosted service. There is no Stripe code and no seat or run counting in the product. **Until those exist the honest offer is a free self-hosted beta**; the table above becomes true feature by feature, and a tier should not be charged for a row marked planned.
 - The users limit and the concurrent-run limit need counting code in the server before they can be enforced.
 
 ## Stripe objects to create (the owner creates them, after the code exists)

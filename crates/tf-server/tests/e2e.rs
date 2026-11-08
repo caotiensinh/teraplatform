@@ -47,6 +47,7 @@ async fn boot_engine(mut cfg: Config, engine: Arc<dyn Engine>) -> App {
     let state = tf_server::AppState::new(store.clone(), engine.name(), mail.clone(), cfg);
     let cancels = state.cancels.clone();
     tf_server::runner::spawn(store.clone(), engine.clone(), cancels.clone());
+    tf_server::drift::spawn(&state);
     App { router: tf_server::app(state), store, mail, cancels }
 }
 
@@ -1666,7 +1667,7 @@ async fn canceling_a_planning_run_stops_the_engine_step_and_the_queue_moves_on()
 
 #[tokio::test]
 async fn a_plain_cancel_is_refused_while_applying_and_force_cancel_wants_an_acknowledgement() {
-    let app = slow_app(300).await;
+    let app = slow_app(1000).await;
     let c = signup(&app, "ana@example.com", "acme").await;
     let ws = new_ws(&c, "prod").await;
     let run = new_run(&c, &ws, CFG_A, json!({ "auto_apply": true })).await;
@@ -1754,7 +1755,7 @@ async fn force_cancel_keeps_the_resources_that_finished_so_the_next_plan_does_no
 
 #[tokio::test]
 async fn only_administrators_can_force_cancel() {
-    let app = slow_app(400).await;
+    let app = slow_app(1500).await;
     let owner = signup(&app, "ana@example.com", "alpha-org").await;
     let member = signup(&app, "cy@example.com", "zeta-org").await;
     let stranger = signup(&app, "bo@example.com", "other").await;
@@ -1785,7 +1786,7 @@ async fn only_administrators_can_force_cancel() {
 
 #[tokio::test]
 async fn the_web_force_cancel_asks_for_confirmation_and_survives_a_double_click() {
-    let app = slow_app(400).await;
+    let app = slow_app(1500).await;
     let c = signup(&app, "ana@example.com", "acme").await;
     let ws = new_ws(&c, "prod").await;
     let run = new_run(&c, &ws, CFG_A, json!({ "auto_apply": true })).await;
@@ -2390,12 +2391,12 @@ async fn k01_a_lock_taken_through_the_api_has_a_lease_that_lapses() {
     assert!(lock_of(&c, &ws).await.is_null(), "a refused lock is not taken");
 
     // a short lease lapses by itself, and a run that was waiting starts
-    let r = c.post_json(&format!("/api/v2/workspaces/{ws}/actions/lock"), json!({ "data": { "attributes": { "lease-seconds": 1 } } })).await;
+    let r = c.post_json(&format!("/api/v2/workspaces/{ws}/actions/lock"), json!({ "data": { "attributes": { "lease-seconds": 2 } } })).await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.body);
     let run = new_run(&c, &ws, CFG_A, json!({})).await;
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(c.get(&format!("/api/v2/runs/{run}")).await.json()["data"]["attributes"]["status"], "pending", "held back while the lease runs");
-    tokio::time::sleep(Duration::from_millis(1800)).await;
+    tokio::time::sleep(Duration::from_millis(2000)).await;
     wait_status(&c, &run, "needs_confirmation").await;
     let w = ws_json(&c, &ws).await;
     assert_eq!(w["data"]["attributes"]["lock"]["owner"].as_str().unwrap().starts_with("run:"), true, "the run now holds it");
@@ -2433,7 +2434,7 @@ async fn k02_a_heartbeat_keeps_a_lock_alive_for_its_holder_only() {
 
 #[tokio::test]
 async fn k03_a_cli_lock_lapses_so_a_crashed_cli_cannot_block_the_workspace_forever() {
-    let app = boot_with(Config { cli_lock_lease_secs: 1, ..Config::default() }).await;
+    let app = boot_with(Config { cli_lock_lease_secs: 2, ..Config::default() }).await;
     let ana = signup(&app, "ana@example.com", "acme").await;
     new_ws(&ana, "prod").await;
     let tok = token_for(&ana, "user").await;
@@ -2441,7 +2442,7 @@ async fn k03_a_cli_lock_lapses_so_a_crashed_cli_cannot_block_the_workspace_forev
     let lock_addr = "/backend/prod/lock";
     assert_eq!(anon.cli(&tok, "LOCK", lock_addr, &[], &lock_doc("lock-A", "ana@laptop")).await.status, StatusCode::OK);
     assert_eq!(anon.cli(&tok, "LOCK", lock_addr, &[], &lock_doc("lock-B", "bo@desktop")).await.status, StatusCode::LOCKED, "while the lease runs");
-    tokio::time::sleep(Duration::from_millis(2200)).await;
+    tokio::time::sleep(Duration::from_millis(3200)).await;
     assert_eq!(anon.cli(&tok, "LOCK", lock_addr, &[], &lock_doc("lock-B", "bo@desktop")).await.status, StatusCode::OK, "the crashed CLI's lock lapsed");
     // the first CLI, if it were still alive, no longer holds anything
     let s = state_doc(1, "lin", "");
@@ -2791,4 +2792,388 @@ async fn k12_state_cannot_be_uploaded_while_a_run_or_the_cli_is_writing() {
     c.post(&format!("/api/v2/workspaces/{ws}/actions/lock")).await;
     let u = upload_url(&c, &ws, 1, None).await;
     assert_eq!(u.status, StatusCode::CREATED, "{}", u.body);
+}
+
+// ================= P1: lint in the plan step =================
+
+const LINTY: &str = "variable \"unused_one\" {\n  type = string\n  description = \"never used\"\n}\n\nresource \"aws_db_instance\" \"main\" {\n  username = \"admin\"\n  password = \"hunter2-secret-value\"\n}\n";
+
+fn finding_rules(run: &Value) -> Vec<String> {
+    run["data"]["attributes"]["lint"].as_array().unwrap().iter().map(|f| f["rule"].as_str().unwrap().to_string()).collect()
+}
+
+#[tokio::test]
+async fn l01_a_run_reports_lint_findings_in_its_record_and_its_log_and_still_plans() {
+    let app = boot().await;
+    let c = signup(&app, "ana@example.com", "acme").await;
+    let ws = new_ws(&c, "prod").await;
+    let run = new_run(&c, &ws, LINTY, json!({})).await;
+    let v = wait_status(&c, &run, "needs_confirmation").await;
+
+    let rules = finding_rules(&v);
+    assert!(rules.contains(&"unused-variable".to_string()) && rules.contains(&"hardcoded-secret".to_string()), "{rules:?}");
+    let f = v["data"]["attributes"]["lint"].as_array().unwrap().iter().find(|f| f["rule"] == "hardcoded-secret").unwrap().clone();
+    assert_eq!((f["severity"].clone(), f["line"].clone()), (json!("warning"), json!(8)), "{f}");
+    assert!(f["file"].is_null(), "plain text has no file");
+
+    let log = log_text(&c, &run).await;
+    assert!(log.contains("Lint: ") && log.contains("lint warning hardcoded-secret (line 8)"), "{log}");
+    assert!(log.find("Lint: ").unwrap() < log.find("Plan").unwrap_or(usize::MAX), "lint comes before the plan: {log}");
+    assert!(!v.to_string().contains("hunter2-secret-value") && !log.contains("hunter2-secret-value"), "a finding never repeats the secret");
+    // it never blocks: the plan exists and can be confirmed
+    assert_eq!(v["data"]["attributes"]["summary"]["add"], 1, "the one resource is planned");
+    assert_eq!(c.post(&format!("/api/v2/runs/{run}/actions/apply")).await.status, StatusCode::ACCEPTED);
+    wait_status(&c, &run, "applied").await;
+}
+
+#[tokio::test]
+async fn l02_a_tidy_configuration_reports_no_findings() {
+    let app = boot().await;
+    let c = signup(&app, "ana@example.com", "acme").await;
+    let ws = new_ws(&c, "prod").await;
+    let tidy = "terraform {\n  required_version = \">= 1.6\"\n  required_providers {\n    aws = {\n      source  = \"hashicorp/aws\"\n      version = \"~> 5.0\"\n    }\n  }\n}\n\nvariable \"bucket\" {\n  type        = string\n  description = \"bucket name\"\n  default     = \"logs\"\n}\n\nresource \"aws_s3_bucket\" \"logs\" {\n  bucket = var.bucket\n}\n";
+    let run = new_run(&c, &ws, tidy, json!({})).await;
+    let v = wait_status(&c, &run, "needs_confirmation").await;
+    assert_eq!(finding_rules(&v), Vec::<String>::new());
+    assert!(log_text(&c, &run).await.contains("Lint: no findings."));
+    // and the page does not show an empty lint box
+    assert!(!c.get(&format!("/runs/{run}")).await.body.contains("id=\"lint\""));
+}
+
+#[tokio::test]
+async fn l03_findings_in_an_uploaded_archive_name_their_file_and_line() {
+    let app = boot().await;
+    let c = signup(&app, "ana@example.com", "acme").await;
+    let ws = new_ws(&c, "prod").await;
+    let cv = c.post(&format!("/api/v2/workspaces/{ws}/configuration-versions")).await.json()["data"]["id"].as_str().unwrap().to_string();
+    let archive = targz(&[
+        ("a.tf", "resource \"null_resource\" \"a\" {\n}\n"),
+        ("variables.tf", "variable \"spare\" {\n  type = string\n  description = \"d\"\n}\n"),
+    ]);
+    assert_eq!(c.put_bytes(&format!("/api/v2/configuration-versions/{cv}/upload"), archive).await.status, StatusCode::OK);
+    let run = c.post_json(&format!("/api/v2/workspaces/{ws}/runs"), json!({ "configuration_version_id": cv })).await.json()["data"]["id"].as_str().unwrap().to_string();
+    let v = wait_status(&c, &run, "needs_confirmation").await;
+    let f = v["data"]["attributes"]["lint"].as_array().unwrap().iter().find(|f| f["rule"] == "unused-variable").expect("a finding for the spare variable").clone();
+    assert_eq!((f["file"].clone(), f["line"].clone()), (json!("variables.tf"), json!(1)), "{f}");
+    assert!(log_text(&c, &run).await.contains("(variables.tf:1)"));
+}
+
+#[tokio::test]
+async fn l04_the_run_page_lists_findings_escaped_and_says_they_do_not_stop_the_run() {
+    let app = boot().await;
+    let c = signup(&app, "ana@example.com", "acme").await;
+    let ws = new_ws(&c, "prod").await;
+    let cfg = "variable \"x<b>y\" {\n}\n";
+    // a name the HCL parser accepts and the page must still escape
+    let run = new_run(&c, &ws, LINTY, json!({})).await;
+    wait_status(&c, &run, "needs_confirmation").await;
+    let page = c.get(&format!("/runs/{run}")).await.body;
+    assert!(page.contains("id=\"lint\"") && page.contains("Lint (") && page.contains("unused-variable") && page.contains("hardcoded-secret"), "{page}");
+    assert!(page.contains("Findings never stop a run."));
+    assert!(!page.contains("hunter2-secret-value"));
+    // the listings carry them too
+    let list = c.get(&format!("/api/v2/workspaces/{ws}/runs")).await.json();
+    assert!(list["data"][0]["attributes"]["lint"].as_array().unwrap().len() >= 2);
+}
+
+#[tokio::test]
+async fn l05_text_the_linter_cannot_read_does_not_stop_the_run() {
+    let app = boot().await;
+    let c = signup(&app, "ana@example.com", "acme").await;
+    let ws = new_ws(&c, "prod").await;
+    let run = new_run(&c, &ws, "resource \"a\" {{{ not valid\n", json!({ "operation": "plan_only" })).await;
+    for _ in 0..300 {
+        let v = c.get(&format!("/api/v2/runs/{run}")).await.json();
+        if matches!(v["data"]["attributes"]["status"].as_str(), Some("planned_and_finished" | "errored" | "needs_confirmation")) {
+            assert_eq!(finding_rules(&v), vec!["parse-error".to_string()]);
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("the run never left planning");
+}
+
+#[tokio::test]
+async fn l06_a_speculative_plan_is_linted_too_and_other_organizations_cannot_see_findings() {
+    let app = boot().await;
+    let c = signup(&app, "ana@example.com", "alpha-org").await;
+    let bo = signup(&app, "bo@example.com", "beta").await;
+    let ws = new_ws(&c, "prod").await;
+    let run = new_run(&c, &ws, LINTY, json!({ "operation": "plan_only" })).await;
+    wait_status(&c, &run, "planned_and_finished").await;
+    let v = c.get(&format!("/api/v2/runs/{run}")).await.json();
+    assert!(finding_rules(&v).contains(&"unused-variable".to_string()));
+    assert_eq!(bo.get(&format!("/api/v2/runs/{run}")).await.status, StatusCode::NOT_FOUND);
+    assert!(!bo.get("/runs").await.body.contains("hardcoded-secret"));
+}
+
+// ================= P3: skip the refresh, and free drift detection =================
+
+fn drift_cfg() -> Config {
+    Config { drift_tick_secs: 1, min_drift_interval_secs: 1, ..Config::default() }
+}
+
+/// A workspace with one applied resource, and the platform's state rewritten so that the resource
+/// "changed outside": the simulator reports a state entry whose hash starts with `drift:`.
+async fn applied_workspace_named(c: &Client, name: &str) -> String {
+    let ws = new_ws(c, name).await;
+    let run = new_run(c, &ws, CFG_A, json!({ "auto_apply": true })).await;
+    wait_status(c, &run, "applied").await;
+    ws
+}
+
+async fn drifted_workspace(c: &Client) -> String {
+    let ws = applied_workspace_named(c, "drifty").await;
+    let v = c.get(&format!("/api/v2/workspaces/{ws}/current-state-version")).await.json();
+    let doc = state_document_of(c, &v).await;
+    let mut state: Value = serde_json::from_str(&doc).unwrap();
+    let first = state["resources"].as_object().unwrap().keys().next().unwrap().clone();
+    state["resources"][&first] = json!("drift:changed-by-hand");
+    state["version"] = json!(4);
+    state["serial"] = json!(1);
+    state["lineage"] = json!("lin-drift");
+    let body = state.to_string();
+    let up = upload_url(c, &ws, 1, Some(&md5_hex(&body))).await;
+    assert_eq!(up.status, StatusCode::CREATED, "{}", up.body);
+    let url = up.json()["data"]["attributes"]["hosted-state-upload-url"].as_str().unwrap().to_string();
+    let put = Client::anon_like(c).send(Method::PUT, &archivist_path(&url), Some("application/json"), body).await;
+    assert_eq!(put.status, StatusCode::OK, "{}", put.body);
+    ws
+}
+
+async fn state_document_of(c: &Client, current: &Value) -> String {
+    let url = current["data"]["attributes"]["hosted-state-download-url"].as_str().unwrap().to_string();
+    c.get(&archivist_path(&url)).await.body
+}
+
+impl Client {
+    fn anon_like(c: &Client) -> Client {
+        Client { router: c.router.clone(), cookie: None, bearer: None, origin: Some("http://localhost".into()) }
+    }
+}
+
+async fn drift_of(c: &Client, ws: &str) -> Value {
+    ws_json(c, ws).await["data"]["attributes"]["drift"].clone()
+}
+
+async fn wait_drift(c: &Client, ws: &str, status: &str) -> Value {
+    for _ in 0..400 {
+        let d = drift_of(c, ws).await;
+        if d["status"] == status {
+            return d;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("the drift status never became {status}; last: {}", drift_of(c, ws).await);
+}
+
+#[tokio::test]
+async fn m01_a_run_can_skip_the_refresh_and_says_so() {
+    let app = boot().await;
+    let c = signup(&app, "ana@example.com", "acme").await;
+    let ws = new_ws(&c, "prod").await;
+    let plain = new_run(&c, &ws, CFG_A, json!({ "operation": "plan_only" })).await;
+    let v = wait_status(&c, &plain, "planned_and_finished").await;
+    assert_eq!((v["data"]["attributes"]["skip-refresh"].clone(), v["data"]["attributes"]["refresh-only"].clone()), (json!(false), json!(false)));
+    assert!(log_text(&c, &plain).await.contains("Refreshing state"));
+
+    let skipped = new_run(&c, &ws, CFG_A, json!({ "operation": "plan_only", "refresh": false })).await;
+    let v = wait_status(&c, &skipped, "planned_and_finished").await;
+    assert_eq!(v["data"]["attributes"]["skip-refresh"], true);
+    let log = log_text(&c, &skipped).await;
+    assert!(log.contains("Skipping the refresh") && !log.contains("Refreshing state"), "{log}");
+
+    // the dashboard form has the box
+    assert!(c.get(&format!("/workspaces/{ws}")).await.body.contains("name=\"skip_refresh\""));
+    let r = c.post_form(&format!("/workspaces/{ws}/runs"), &[("config", CFG_A), ("mode", "plan_only"), ("skip_refresh", "on")]).await;
+    assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
+    let id = r.location().rsplit('/').next().unwrap().to_string();
+    assert_eq!(wait_status(&c, &id, "planned_and_finished").await["data"]["attributes"]["skip-refresh"], true);
+}
+
+#[tokio::test]
+async fn m02_a_drift_check_on_request_reports_what_changed_outside() {
+    let app = boot().await;
+    let c = signup(&app, "ana@example.com", "alpha-org").await;
+    let bo = signup(&app, "bo@example.com", "beta").await;
+    let none = new_ws(&c, "empty").await;
+    let check = |ws: &str| format!("/api/v2/workspaces/{ws}/actions/check-drift");
+    assert_eq!(c.post(&check(&none)).await.status, StatusCode::CONFLICT, "nothing to check without configuration or state");
+    // a configuration but no state yet (only a speculative plan so far): still nothing to refresh
+    let planned_only = new_ws(&c, "planned-only").await;
+    let spec = new_run(&c, &planned_only, CFG_A, json!({ "operation": "plan_only" })).await;
+    wait_status(&c, &spec, "planned_and_finished").await;
+    let r = c.post(&check(&planned_only)).await;
+    assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.body);
+    assert!(r.body.contains("no state"), "{}", r.body);
+
+    let ws = applied_workspace(&c).await;
+    let r = c.post(&check(&ws)).await;
+    assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.body);
+    let run = r.json()["data"]["id"].as_str().unwrap().to_string();
+    assert_eq!(r.json()["data"]["attributes"]["refresh-only"], true);
+    let v = wait_status(&c, &run, "planned_and_finished").await;
+    assert_eq!(v["data"]["attributes"]["source"], "api");
+    let d = wait_drift(&c, &ws, "clean").await;
+    assert_eq!((d["changes"].clone(), d["run_id"].clone()), (json!(0), json!(run)));
+    assert!(lock_of(&c, &ws).await.is_null(), "a drift check takes no lock");
+
+    // the infrastructure changed outside: the next check finds it
+    let ws2 = drifted_workspace(&c).await;
+    let run2 = c.post(&check(&ws2)).await.json()["data"]["id"].as_str().unwrap().to_string();
+    let v2 = wait_status(&c, &run2, "planned_and_finished").await;
+    assert_eq!(v2["data"]["attributes"]["summary"]["change"], 1);
+    let d2 = wait_drift(&c, &ws2, "drifted").await;
+    assert_eq!(d2["changes"], 1);
+    let page = c.get(&format!("/workspaces/{ws2}")).await.body;
+    assert!(page.contains("1 changed") && page.contains("Check for drift now"), "{page}");
+    assert!(log_text(&c, &run2).await.contains("has changed outside the platform"));
+
+    // a drift check cannot be applied, and it does not stop a real run
+    assert_eq!(c.post(&format!("/api/v2/runs/{run2}/actions/apply")).await.status, StatusCode::CONFLICT);
+    let more = format!("{CFG_A}resource \"aws_s3_bucket\" \"more\" {{\n  bucket = \"m\"\n}}\n");
+    let real = new_run(&c, &ws2, &more, json!({})).await;
+    wait_status(&c, &real, "needs_confirmation").await;
+
+    assert_eq!(bo.post(&check(&ws2)).await.status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn m03_drift_is_checked_on_a_schedule_and_again_after_the_interval() {
+    let app = boot_with(drift_cfg()).await;
+    let c = signup(&app, "ana@example.com", "acme").await;
+    let ws = applied_workspace(&c).await;
+    assert!(drift_of(&c, &ws).await.is_null(), "nothing is checked until a schedule is set");
+    let r = c.send(Method::PATCH, &format!("/api/v2/workspaces/{ws}"), Some("application/json"), json!({ "drift-interval": 1 }).to_string()).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert_eq!(r.json()["data"]["attributes"]["drift-interval"], 1);
+    let first = wait_drift(&c, &ws, "clean").await;
+    let first_run = first["run_id"].as_str().unwrap().to_string();
+    let run = c.get(&format!("/api/v2/runs/{first_run}")).await.json();
+    assert_eq!((run["data"]["attributes"]["source"].clone(), run["data"]["attributes"]["refresh-only"].clone()), (json!("schedule"), json!(true)));
+    // and again once the interval has passed
+    for _ in 0..300 {
+        if drift_of(&c, &ws).await["run_id"].as_str() != Some(first_run.as_str()) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("no second scheduled check");
+}
+
+#[tokio::test]
+async fn m04_the_schedule_is_validated_and_can_be_turned_off() {
+    let app = boot().await;
+    let ana = signup(&app, "ana@example.com", "alpha-org").await;
+    let cy = signup(&app, "cy@example.com", "zeta-org").await;
+    make_member(&app, "ana@example.com", "cy@example.com").await;
+    let ws = new_ws(&ana, "prod").await;
+    let uri = format!("/api/v2/workspaces/{ws}");
+    let patch = |c: &Client, body: Value| {
+        let (c, uri) = (c.clone(), uri.clone());
+        async move { c.send(Method::PATCH, &uri, Some("application/json"), body.to_string()).await }
+    };
+    // the default shortest interval is five minutes
+    for (what, body) in [("too short", json!({ "drift-interval": 60 })), ("zero", json!({ "drift-interval": 0 })), ("text", json!({ "drift-interval": "hourly" })), ("negative", json!({ "drift-interval": -5 }))] {
+        let r = patch(&ana, body).await;
+        assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY, "{what}: {}", r.body);
+    }
+    assert_eq!(patch(&cy, json!({ "drift-interval": 3600 })).await.status, StatusCode::FORBIDDEN, "members do not set schedules");
+    let on = patch(&ana, json!({ "drift-interval": 3600 })).await;
+    assert_eq!(on.json()["data"]["attributes"]["drift-interval"], 3600);
+    // leaving it out changes nothing; null turns it off
+    assert_eq!(patch(&ana, json!({ "description": "x" })).await.json()["data"]["attributes"]["drift-interval"], 3600);
+    assert!(patch(&ana, json!({ "drift-interval": null })).await.json()["data"]["attributes"]["drift-interval"].is_null());
+}
+
+#[tokio::test]
+async fn m05_only_one_drift_check_is_waiting_at_a_time() {
+    let app = {
+        let engine: Arc<dyn Engine> = Arc::new(FakeEngine::new(Duration::from_millis(900)));
+        boot_engine(drift_cfg(), engine).await
+    };
+    let c = signup(&app, "ana@example.com", "acme").await;
+    let ws = new_ws(&c, "prod").await;
+    let run = new_run(&c, &ws, CFG_A, json!({ "auto_apply": true })).await;
+    wait_status_for(&c, &run, "applied", 200).await;
+    c.send(Method::PATCH, &format!("/api/v2/workspaces/{ws}"), Some("application/json"), json!({ "drift-interval": 1 }).to_string()).await;
+    let mut most_open = 0;
+    for _ in 0..80 {
+        let runs = c.get(&format!("/api/v2/workspaces/{ws}/runs")).await.json();
+        let open = runs["data"].as_array().unwrap().iter().filter(|r| r["attributes"]["refresh-only"] == true && matches!(r["attributes"]["status"].as_str(), Some("pending" | "planning"))).count();
+        most_open = most_open.max(open);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+    }
+    assert!(most_open >= 1, "a check was started");
+    assert_eq!(most_open, 1, "never a pile-up behind a slow check");
+}
+
+#[tokio::test]
+async fn m06_a_failed_check_is_recorded_and_not_retried_every_tick() {
+    let app = boot_with(Config { drift_tick_secs: 1, min_drift_interval_secs: 1, ..Config::default() }).await;
+    let c = signup(&app, "ana@example.com", "acme").await;
+    let ws = applied_workspace(&c).await;
+    tokio::time::sleep(Duration::from_millis(1100)).await; // configuration versions are ordered by the second
+    // the latest configuration now fails to plan
+    let bad = new_run(&c, &ws, "fail_plan\n", json!({ "operation": "plan_only" })).await;
+    wait_status(&c, &bad, "errored").await;
+    let r = c.post(&format!("/api/v2/workspaces/{ws}/actions/check-drift")).await;
+    assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.body);
+    let d = wait_drift(&c, &ws, "error").await;
+    assert_eq!(d["changes"], 0);
+    assert!(d["checked_at"].as_u64().unwrap() > 0, "the failure sets the time, so a schedule waits its interval");
+}
+
+#[tokio::test]
+async fn m07_the_settings_page_sets_the_schedule_and_the_workspace_page_checks_now() {
+    let app = boot().await;
+    let ana = signup(&app, "ana@example.com", "alpha-org").await;
+    let ws = applied_workspace(&ana).await;
+    let page = format!("/workspaces/{ws}/settings");
+    assert!(ana.get(&page).await.body.contains("name=\"drift_minutes\""));
+    for (what, v) in [("under the minimum", "3"), ("not a number", "soon"), ("zero", "0")] {
+        let r = ana.post_form(&page, &[("name", "prod"), ("drift_minutes", v)]).await;
+        assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY, "{what}");
+        assert!(r.body.contains("whole number of minutes, at least 5"), "{what}: {}", r.body);
+    }
+    assert_eq!(ana.post_form(&page, &[("name", "prod"), ("drift_minutes", "10")]).await.status, StatusCode::SEE_OTHER);
+    assert_eq!(ws_json(&ana, &ws).await["data"]["attributes"]["drift-interval"], 600);
+    assert!(ana.get(&page).await.body.contains("name=\"drift_minutes\" value=\"10\""));
+    assert_eq!(ana.post_form(&page, &[("name", "prod"), ("drift_minutes", "")]).await.status, StatusCode::SEE_OTHER);
+    assert!(ws_json(&ana, &ws).await["data"]["attributes"]["drift-interval"].is_null());
+
+    // check now from the workspace page; without a state there is no button and the action is refused
+    let r = ana.post_form(&format!("/workspaces/{ws}/check-drift"), &[]).await;
+    assert_eq!(r.status, StatusCode::SEE_OTHER);
+    let run = r.location().rsplit('/').next().unwrap().to_string();
+    wait_status(&ana, &run, "planned_and_finished").await;
+    let fresh = new_ws(&ana, "fresh").await;
+    assert!(!ana.get(&format!("/workspaces/{fresh}")).await.body.contains("Check for drift now"));
+    assert_eq!(ana.post_form(&format!("/workspaces/{fresh}/check-drift"), &[]).await.status, StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn m08_a_refresh_only_run_can_be_asked_for_directly_but_never_applied_or_skipped() {
+    let app = boot().await;
+    let c = signup(&app, "ana@example.com", "acme").await;
+    let ws = new_ws(&c, "prod").await;
+    let runs = format!("/api/v2/workspaces/{ws}/runs");
+    let r = c.post_json(&runs, json!({ "config": CFG_A, "operation": "refresh_only", "auto_apply": true })).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.body);
+    let id = r.json()["data"]["id"].as_str().unwrap().to_string();
+    assert_eq!(r.json()["data"]["attributes"]["operation"], "plan_only", "a drift check is always speculative");
+    wait_status(&c, &id, "planned_and_finished").await;
+    let both = c.post_json(&runs, json!({ "config": CFG_A, "operation": "refresh_only", "refresh": false })).await;
+    assert_eq!(both.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", both.body);
+}
+
+async fn wait_status_for(c: &Client, run: &str, want: &str, tries: u32) -> Value {
+    for _ in 0..tries {
+        let v = c.get(&format!("/api/v2/runs/{run}")).await.json();
+        if v["data"]["attributes"]["status"] == want {
+            return v;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("run {run} never reached {want}");
 }

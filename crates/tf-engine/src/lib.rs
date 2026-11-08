@@ -110,6 +110,10 @@ pub struct EngineVars {
     pub terraform: BTreeMap<String, String>,
     /// Environment variables for the engine process.
     pub env: BTreeMap<String, String>,
+    /// Plan without refreshing the state first.
+    pub skip_refresh: bool,
+    /// Only refresh the state and report what drifted; there is nothing to apply afterwards.
+    pub refresh_only: bool,
 }
 
 pub struct PlanOutput {

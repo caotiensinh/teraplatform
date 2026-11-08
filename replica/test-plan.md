@@ -246,3 +246,38 @@ Total: 211 tests (was 191).
 | F10-PG | contract and e2e on PostgreSQL, migration 0005, with real tofu and Docker tests | PostgreSQL + tofu + Docker | pass |
 
 Total: 238 tests (was 211).
+
+## F11 lint in the plan step (fix P1)
+
+| id | what | how | result |
+| --- | --- | --- | --- |
+| F11-U | each rule finds what it should and nothing on a tidy configuration; empty, odd and unparseable input; file and line for joined archives; stable order | 13 unit tests | pass |
+| F11-S | findings kept in order with file and line, replaced not appended, survive state changes, unknown run is NotFound | store contract | pass (both stores) |
+| F11-L01 | findings in the record, the log (before the plan), no secret value anywhere, the run still plans and applies | e2e l01 | pass |
+| F11-L02 | a tidy configuration: no findings, "no findings" in the log, no box on the page | e2e l02 | pass |
+| F11-L03 | archive: file name and line within the file | e2e l03 | pass |
+| F11-L04 | the page lists findings, says they do not stop the run, no secret; listings carry them | e2e l04 | pass |
+| F11-L05 | unparseable text: one `parse-error` and the run goes on | e2e l05 | pass |
+| F11-L06 | speculative plans are linted; another organization cannot see them | e2e l06 | pass |
+| F11-M | 12 mutation checks: 11 turn a test red (two needed a stronger test first: one configuration had to use two different resource types of the same provider); the twelfth, accepting a mixed template as a lone interpolation, is an equivalent mutant because the check for a closing brace already rejects it | mutation | see backend.md |
+
+## F12 skip the refresh, drift checks (fix P3)
+
+| id | what | how | result |
+| --- | --- | --- | --- |
+| F12-E | simulator: refresh-only reports drifted entries only; skip is said in the log; both together refused; `resource_drift` parsing | engine unit tests | pass |
+| F12-R | a real `tofu`: `-refresh-only` and `-refresh=false` accepted, no drift on a built-in resource, a configuration change still planned when the refresh is skipped | real_tofu (Windows) | pass |
+| F12-S1 | options kept with the run; a drift check must be plan-only and cannot skip | store contract | pass (both stores) |
+| F12-S2 | due checks: interval, state needed, one waiting check holds the next, recording restarts the interval, off, bad values | store contract | pass |
+| F12-S3 | the latest configuration is one that has its content | store contract | pass |
+| F12-M01 | skip the refresh through the API and the form | e2e m01 | pass |
+| F12-M02 | check now: refused without config or state, clean, drifted (found by the simulator convention), no lock, cannot be applied, real runs go on, other organization 404 | e2e m02 | pass |
+| F12-M03 | scheduled check, then again after the interval | e2e m03 | pass |
+| F12-M04 | interval validation, members refused, null turns it off, leaving it out keeps it | e2e m04 | pass |
+| F12-M05 | never more than one check waiting behind a slow engine | e2e m05 | pass |
+| F12-M06 | a failed check is recorded with its time | e2e m06 | pass |
+| F12-M07 | settings page field and the check-now button | e2e m07 | pass |
+| F12-M08 | refresh_only through the API is plan-only, cannot skip | e2e m08 | pass |
+| F12-X | 14 mutation checks, all turn a test red (one, queuing a check without a state, needed a stronger test first) | mutation | see backend.md |
+
+Total: 277 tests (was 259), run on PostgreSQL with the real tofu and Docker cases, none skipped.

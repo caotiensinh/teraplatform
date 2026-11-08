@@ -96,6 +96,8 @@ async fn main() {
         api_rate_per_sec: env("TF_API_RATE").and_then(|v| v.parse().ok()).unwrap_or(30),
         api_lock_lease_secs: env("TF_API_LOCK_LEASE_SECS").and_then(|v| v.parse().ok()).unwrap_or(3600),
         cli_lock_lease_secs: env("TF_CLI_LOCK_LEASE_SECS").and_then(|v| v.parse().ok()).unwrap_or(12 * 3600),
+        min_drift_interval_secs: env("TF_MIN_DRIFT_INTERVAL_SECS").and_then(|v| v.parse().ok()).unwrap_or(300),
+        drift_tick_secs: env("TF_DRIFT_TICK_SECS").and_then(|v| v.parse().ok()).unwrap_or(60),
     };
     if !cfg.cookie_secure {
         eprintln!("warning: TF_COOKIE_SECURE is off; set it to 1 when serving over HTTPS");
@@ -109,6 +111,7 @@ async fn main() {
     }
     let state = tf_server::AppState::new(store.clone(), engine.name(), Arc::new(LogMailer), cfg);
     tf_server::runner::spawn(store, engine.clone(), state.cancels.clone());
+    tf_server::drift::spawn(&state);
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap_or_else(|e| die(&format!("cannot listen on {addr}: {e}")));
     eprintln!("tf-server listening on http://{addr} (engine: {})", engine.name());
     if let Err(e) = axum::serve(listener, tf_server::app(state)).await {

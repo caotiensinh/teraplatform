@@ -17,6 +17,7 @@ tf-core = { path = "../tf-core" }
 tf-crypto = { path = "../tf-crypto" }
 tf-engine = { path = "../tf-engine" }
 tf-store = { path = "../tf-store" }
+tf-lint = { path = "../tf-lint" }
 axum = "0.8"
 argon2 = "0.5"
 tokio.workspace = true

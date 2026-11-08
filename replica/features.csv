@@ -22,7 +22,7 @@ Policy as code (own format),policy,should,yes,no,advisory / soft / hard levels w
 Cost estimation,policy,could,yes,no,
 Run tasks (external hooks pre/post),runs,could,yes,no,
 Notifications (webhook/email/Slack),ops,could,yes,no,guess; page not read
-Drift detection / continuous validation,ops,should,yes,no,paid tier in original
+Drift detection / continuous validation,ops,should,yes,partial,"drift detection on a schedule or on request, free, with the result on the workspace; no notifications, no continuous validation (checks of custom conditions), no fix proposal"
 Agents / self-hosted runners,ops,should,yes,no,guess on details
 State encryption at rest,security,must,yes,partial,"AES-256-GCM, key per workspace, master key from environment; no KMS key providers, no rotation"
 Plan file encryption,security,should,yes,yes,saved plans sealed with run-bound key
@@ -37,8 +37,8 @@ Sentinel policy language,policy,could,yes,skip,proprietary; use own format
 Public provider registry content,registry,could,yes,skip,owned by third parties
 HashiCorp branding / docs text,legal,could,yes,skip,trademark and copyright
 Hosted run infrastructure and user network,ops,could,yes,skip,not clonable
-Lint in the plan step (HCL parse + rules),runs,should,no,no,"fix P1 in fixes.md: 211 votes on OpenTofu issue 2213; an improvement over the original"
+Lint in the plan step (HCL parse + rules),runs,should,no,yes,"fix P1: nine rules (unused variables, unpinned or undeclared providers, literal secrets, lone interpolation, missing descriptions and types, parse errors) run before every plan, shown on the run page, in the log and the API; never blocks a run; no rule configuration or silencing yet; 211 votes on OpenTofu issue 2213"
 Pull-request plan comment with lock until merge,vcs,should,no,no,"fix P2: Atlantis-style flow; 57 keyword matches (about half real); needs the VCS webhook row first"
-Scheduled refresh-only drift runs + skip refresh of unchanged resources,runs,should,no,no,"fix P3: 131 + 31 votes on OpenTofu issues 1703 and 4372; drift detection is a paid feature of the original"
+Scheduled refresh-only drift runs + skip refresh of unchanged resources,runs,should,no,partial,"fix P3: scheduled and on-demand drift checks (refresh-only, no lock, never applied) with the result kept on the workspace, and a per-run option to skip the refresh; NOT done: skipping the refresh only for resources whose configuration did not change (what the 131-vote request asks for: that needs tofu itself), notifications, a one-click fix; 131 + 31 votes on OpenTofu issues 1703 and 4372"
 Shared provider and module cache between runs,engine,could,no,no,"fix P4: 62 votes on OpenTofu issue 1199"
 Ordered multi-workspace apply (stack),runs,should,no,no,"fix P5: 202 votes on OpenTofu issue 931; not checked whether HCP Terraform Stacks already covers it (page not read)"
